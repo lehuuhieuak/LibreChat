@@ -29,4 +29,8 @@ jobs:
         run: |
           git checkout main
           git merge upstream/main
-          git push origin main
+      - name: Push changes
+        env:
+          PAT: ${{ secrets.PAT_TOKEN }}
+        run: |
+          git push https://x-access-token:${PAT}@github.com/lehuuhieuak/LibreChat.git main
