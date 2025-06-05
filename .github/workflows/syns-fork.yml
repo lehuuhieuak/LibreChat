@@ -21,7 +21,7 @@ jobs:
 
       - name: Add upstream and sync
         run: |
-          git remote add upstream https://github.com/lehuuhieuak/LibreChat.git
+          git remote add upstream https://github.com/danny-avila/LibreChat.git
           git fetch upstream
           git checkout main
           git merge upstream/main
