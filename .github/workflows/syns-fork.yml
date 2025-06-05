@@ -2,42 +2,27 @@ name: Sync Fork
 
 on:
   schedule:
-    - cron: '0 0 * * *' # Chạy hàng ngày vào 00:00 UTC
-  workflow_dispatch: # Cho phép chạy thủ công
+    - cron: '0 * * * *'  # Chạy mỗi giờ (bạn có thể chỉnh)
+  workflow_dispatch:     # Cho phép chạy thủ công
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v2
+      - name: Checkout the fork repository
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Setup Git
+      - name: Set Git user
         run: |
-          git config --global user.name 'lehuuhieuak'
-          git config --global user.email '01643815296h@gmail.com'
+          git config user.name "lehuuhieuak"
+          git config user.email "01643815296h@gmail.com.com"
 
-      - name: Add upstream
-        run: git remote add upstream https://github.com/danny-avila/LibreChat.git
-
-      - name: Fetch upstream
-        run: git fetch upstream
-
-      - name: Checkout main
-        run: git checkout main
-
-      - name: Pull from origin
-        run: git pull origin main
-
-      - name: Merge upstream changes
+      - name: Add upstream and sync
         run: |
+          git remote add upstream https://github.com/lehuuhieuak/LibreChat.git
+          git fetch upstream
           git checkout main
           git merge upstream/main
-          
-      - name: Push changes
-        env:
-          PAT: ${{ secrets.PAT_TOKEN }}
-        run: |
-          git push https://x-access-token:${PAT}@github.com/lehuuhieuak/LibreChat.git main
+          git push https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git main
