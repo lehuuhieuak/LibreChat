@@ -11,8 +11,8 @@ const {
   replaceSpecialVars,
   providerEndpointMap,
 } = require('librechat-data-provider');
-const { getProviderConfig } = require('~/server/services/Endpoints');
 const generateArtifactsPrompt = require('~/app/clients/prompts/artifacts');
+const { getProviderConfig } = require('~/server/services/Endpoints');
 const { processFiles } = require('~/server/services/Files/process');
 const { getFiles, getToolFilesByIds } = require('~/models/File');
 const { getConvoFiles } = require('~/models/Conversation');
@@ -82,6 +82,7 @@ const initializeAgent = async ({
     attachments: currentFiles,
     tool_resources: agent.tool_resources,
     requestFileSet: new Set(requestFiles?.map((file) => file.file_id)),
+    agentId: agent.id,
   });
 
   const provider = agent.provider;
@@ -149,7 +150,9 @@ const initializeAgent = async ({
   ) {
     throw new Error(`{ "type": "${ErrorTypes.GOOGLE_TOOL_CONFLICT}"}`);
   } else if (
-    (agent.provider === Providers.OPENAI || agent.provider === Providers.AZURE) &&
+    (agent.provider === Providers.OPENAI ||
+      agent.provider === Providers.AZURE ||
+      agent.provider === Providers.ANTHROPIC) &&
     options.tools?.length &&
     structuredTools?.length
   ) {
