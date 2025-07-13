@@ -1,9 +1,12 @@
 require('events').EventEmitter.defaultMaxListeners = 100;
 const { logger } = require('@librechat/data-schemas');
+const { DynamicStructuredTool } = require('@langchain/core/tools');
+const { getBufferString, HumanMessage } = require('@langchain/core/messages');
 const {
   sendEvent,
   createRun,
   Tokenizer,
+  checkAccess,
   memoryInstructions,
   createMemoryProcessor,
 } = require('@librechat/api');
@@ -30,17 +33,20 @@ const {
   bedrockInputSchema,
   removeNullishValues,
 } = require('librechat-data-provider');
-const { DynamicStructuredTool } = require('@langchain/core/tools');
-const { getBufferString, HumanMessage } = require('@langchain/core/messages');
-const { createGetMCPAuthMap, checkCapability } = require('~/server/services/Config');
+const {
+  findPluginAuthsByKeys,
+  getFormattedMemories,
+  deleteMemory,
+  setMemory,
+} = require('~/models');
+const { getMCPAuthMap, checkCapability, hasCustomUserVars } = require('~/server/services/Config');
 const { addCacheControl, createContextHandlers } = require('~/app/clients/prompts');
 const { initializeAgent } = require('~/server/services/Endpoints/agents/agent');
 const { spendTokens, spendStructuredTokens } = require('~/models/spendTokens');
-const { getFormattedMemories, deleteMemory, setMemory } = require('~/models');
 const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { getProviderConfig } = require('~/server/services/Endpoints');
-const { checkAccess } = require('~/server/middleware/roles/access');
 const BaseClient = require('~/app/clients/BaseClient');
+const { getRoleByName } = require('~/models/Role');
 const { loadAgent } = require('~/models/Agent');
 const { getMCPManager } = require('~/config');
 
@@ -53,6 +59,7 @@ const omitTitleOptions = new Set([
   'thinkingBudget',
   'includeThoughts',
   'maxOutputTokens',
+  'additionalModelRequestFields',
 ]);
 
 /**
@@ -401,7 +408,12 @@ class AgentClient extends BaseClient {
     if (user.personalization?.memories === false) {
       return;
     }
-    const hasAccess = await checkAccess(user, PermissionTypes.MEMORIES, [Permissions.USE]);
+    const hasAccess = await checkAccess({
+      user,
+      permissionType: PermissionTypes.MEMORIES,
+      permissions: [Permissions.USE],
+      getRoleByName,
+    });
 
     if (!hasAccess) {
       logger.debug(
@@ -519,7 +531,10 @@ class AgentClient extends BaseClient {
           messagesToProcess = [...messages.slice(-messageWindowSize)];
         }
       }
-      return await this.processMemory(messagesToProcess);
+
+      const bufferString = getBufferString(messagesToProcess);
+      const bufferMessage = new HumanMessage(`# Current Chat:\n\n${bufferString}`);
+      return await this.processMemory([bufferMessage]);
     } catch (error) {
       logger.error('Memory Agent failed to process memory', error);
     }
@@ -691,8 +706,6 @@ class AgentClient extends BaseClient {
         version: 'v2',
       };
 
-      const getUserMCPAuthMap = await createGetMCPAuthMap();
-
       const toolSet = new Set((this.options.agent.tools ?? []).map((tool) => tool && tool.name));
       let { messages: initialMessages, indexTokenCountMap } = formatAgentMessages(
         payload,
@@ -813,10 +826,11 @@ class AgentClient extends BaseClient {
         }
 
         try {
-          if (getUserMCPAuthMap) {
-            config.configurable.userMCPAuthMap = await getUserMCPAuthMap({
+          if (await hasCustomUserVars()) {
+            config.configurable.userMCPAuthMap = await getMCPAuthMap({
               tools: agent.tools,
               userId: this.options.req.user.id,
+              findPluginAuthsByKeys,
             });
           }
         } catch (err) {
@@ -1034,6 +1048,12 @@ class AgentClient extends BaseClient {
       options.llmConfig?.azureOpenAIApiInstanceName == null
     ) {
       provider = Providers.OPENAI;
+    } else if (
+      endpoint === EModelEndpoint.azureOpenAI &&
+      options.llmConfig?.azureOpenAIApiInstanceName != null &&
+      provider !== Providers.AZURE
+    ) {
+      provider = Providers.AZURE;
     }
 
     /** @type {import('@librechat/agents').ClientOptions} */

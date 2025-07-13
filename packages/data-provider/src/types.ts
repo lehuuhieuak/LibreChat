@@ -109,10 +109,14 @@ export type TPayload = Partial<TMessage> &
     messages?: TMessages;
     isTemporary: boolean;
     ephemeralAgent?: TEphemeralAgent | null;
+    editedContent?: {
+      index: number;
+      text: string;
+      type: 'text' | 'think';
+    } | null;
   };
 
 export type TSubmission = {
-  artifacts?: string;
   plugin?: TResPlugin;
   plugins?: TResPlugin[];
   userMessage: TMessage;
@@ -127,6 +131,11 @@ export type TSubmission = {
   endpointOption: TEndpointOption;
   clientTimestamp?: string;
   ephemeralAgent?: TEphemeralAgent | null;
+  editedContent?: {
+    index: number;
+    text: string;
+    type: 'text' | 'think';
+  } | null;
 };
 
 export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialResponse: TMessage };
@@ -134,7 +143,7 @@ export type EventSubmission = Omit<TSubmission, 'initialResponse'> & { initialRe
 export type TPluginAction = {
   pluginKey: string;
   action: 'install' | 'uninstall';
-  auth?: Partial<Record<string, string>>;
+  auth?: Partial<Record<string, string>> | null;
   isEntityTool?: boolean;
 };
 
@@ -144,7 +153,7 @@ export type TUpdateUserPlugins = {
   isEntityTool?: boolean;
   pluginKey: string;
   action: string;
-  auth?: Partial<Record<string, string | null>>;
+  auth?: Partial<Record<string, string | null>> | null;
 };
 
 // TODO `label` needs to be changed to the proper `TranslationKeys`
