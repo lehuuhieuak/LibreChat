@@ -3,7 +3,7 @@ const { Keyv } = require('keyv');
 const { cacheConfig } = require('./cacheConfig');
 const { keyvRedisClient, ioredisClient, GLOBAL_PREFIX_SEPARATOR } = require('./redisClients');
 const { Time } = require('librechat-data-provider');
-const ConnectRedis = require('connect-redis').default;
+const { RedisStore: ConnectRedis } = require('connect-redis');
 const MemoryStore = require('memorystore')(require('express-session'));
 const { violationFile } = require('./keyvFiles');
 const { RedisStore } = require('rate-limit-redis');
@@ -16,7 +16,10 @@ const { RedisStore } = require('rate-limit-redis');
  * @returns {Keyv} Cache instance.
  */
 const standardCache = (namespace, ttl = undefined, fallbackStore = undefined) => {
-  if (cacheConfig.USE_REDIS) {
+  if (
+    cacheConfig.USE_REDIS &&
+    !cacheConfig.FORCED_IN_MEMORY_CACHE_NAMESPACES?.includes(namespace)
+  ) {
     const keyvRedis = new KeyvRedis(keyvRedisClient);
     const cache = new Keyv(keyvRedis, { namespace, ttl });
     keyvRedis.namespace = cacheConfig.REDIS_KEY_PREFIX;
