@@ -1,5 +1,5 @@
 /* MCP */
-export * from './mcp/manager';
+export * from './mcp/MCPManager';
 export * from './mcp/oauth';
 export * from './mcp/auth';
 export * from './mcp/zod';
@@ -15,8 +15,12 @@ export * from './crypto';
 export * from './flow/manager';
 /* Middleware */
 export * from './middleware';
+/* Memory */
+export * from './memory';
 /* Agents */
 export * from './agents';
+/* Prompts */
+export * from './prompts';
 /* Endpoints */
 export * from './endpoints';
 /* Files */
