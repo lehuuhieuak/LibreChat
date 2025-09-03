@@ -3,13 +3,9 @@ name: syns fork
 
 # Cấu hình khi nào workflow sẽ chạy
 on:
-  # Chạy theo lịch trình (sử dụng cú pháp cron)
   schedule:
-    # Chạy vào 00:00 UTC mỗi ngày (bạn có thể thay đổi)
-    # 0 0 * * * -> phút giờ ngày tháng thứ
     - cron: '0 0 * * *'
   
-  # Cho phép chạy workflow này thủ công từ tab Actions
   workflow_dispatch:
 
 jobs:
@@ -18,12 +14,17 @@ jobs:
     # Sử dụng máy ảo Ubuntu phiên bản mới nhất
     runs-on: ubuntu-latest
 
+    # === BẮT ĐẦU PHẦN SỬA LỖI ===
+    # Cấp quyền cho GITHUB_TOKEN để có thể push code và cập nhật workflows
+    permissions:
+      contents: write
+    # === KẾT THÚC PHẦN SỬA LỖI ===
+
     steps:
       # Bước 1: Checkout code từ repository của bạn (bản fork)
       - name: 1. Checkout repository của bạn
         uses: actions/checkout@v4
         with:
-          # Lấy toàn bộ lịch sử git để có thể merge một cách chính xác
           fetch-depth: 0
 
       # Bước 2: Thêm remote trỏ đến repository gốc (upstream)
@@ -39,15 +40,10 @@ jobs:
       # Bước 4: Hợp nhất (merge) các thay đổi vào nhánh chính của bạn
       - name: 4. Hợp nhất (merge) thay đổi từ upstream/main
         run: |
-          # Cấu hình git user để có thể tạo merge commit nếu cần
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # Checkout vào nhánh chính của bạn (thường là main hoặc master)
           git checkout main
-          
-          # Merge các thay đổi từ nhánh main của upstream vào
-          # --no-edit để tự động chấp nhận commit message mặc định khi merge
           git merge upstream/main --no-edit
 
       # Bước 5: Đẩy (push) các thay đổi đã hợp nhất lên repository của bạn
