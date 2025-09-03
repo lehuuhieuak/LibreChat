@@ -1,39 +1,18 @@
 name: Sync Fork
 
 on:
-  push:
-    branches:
-      - "main"
   schedule:
-    - cron: '0 0 * * *' #every 24h
-  workflow_dispatch:
+    - cron: '*/30 * * * *' # every 30 minutes
+  workflow_dispatch: # on button click
 
-permissions:
-  contents: write
-  
 jobs:
   sync:
+
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout your forked repository
-        uses: actions/checkout@v4
+      - uses: tgymnich/fork-sync@v1.8
         with:
-          repository: lehuuhieuak/LibreChat
-          token: ${{ secrets.PAT_TOKEN }}
-          fetch-depth: 0
-
-      - name: Add upstream repository
-        run: |
-          git remote add upstream https://github.com/danny-avila/LibreChat.git
-          git fetch upstream
-
-      - name: Sync with upstream/main
-        run: |
-          git fetch upstream main
-          git checkout -B main origin/main
-          git merge upstream/main
-          git push origin main
-
-      - name: Clean up
-        run: |
-          git remote remove upstream
+          owner: llvm
+          base: main
+          head: main
