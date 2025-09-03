@@ -1,21 +1,55 @@
-name: Auto Sync Fork
+# Tên của workflow, sẽ hiển thị trong tab "Actions" của GitHub
+name: syns fork
 
+# Cấu hình khi nào workflow sẽ chạy
 on:
+  # Chạy theo lịch trình (sử dụng cú pháp cron)
   schedule:
-    - cron: '0 0 * * *' # Runs daily at midnight UTC
-  workflow_dispatch: # Allows manual triggering
+    # Chạy vào 00:00 UTC mỗi ngày (bạn có thể thay đổi)
+    # 0 0 * * * -> phút giờ ngày tháng thứ
+    - cron: '0 0 * * *'
+  
+  # Cho phép chạy workflow này thủ công từ tab Actions
+  workflow_dispatch:
 
 jobs:
+  # Tên của job, bạn có thể đặt tùy ý
   sync:
+    # Sử dụng máy ảo Ubuntu phiên bản mới nhất
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
-      - name: Sync Fork with Upstream
-        uses: tgymnich/fork-sync@v1.2.1 # Example action, replace with your chosen one
+    steps:
+      # Bước 1: Checkout code từ repository của bạn (bản fork)
+      - name: 1. Checkout repository của bạn
+        uses: actions/checkout@v4
         with:
-          upstream_owner: 'danny-avila' # Replace with the actual upstream owner
-          upstream_repo: 'LibreChat' # Replace with the actual upstream repository name
-          target_branch: 'main' # Replace with the branch you want to sync
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Lấy toàn bộ lịch sử git để có thể merge một cách chính xác
+          fetch-depth: 0
+
+      # Bước 2: Thêm remote trỏ đến repository gốc (upstream)
+      - name: 2. Thêm remote upstream
+        run: |
+          # THAY THẾ URL BÊN DƯỚI bằng URL của repository gốc mà bạn đã fork
+          git remote add upstream https://github.com/danny-avila/LibreChat.git
+
+      # Bước 3: Lấy (fetch) các thay đổi từ repository gốc
+      - name: 3. Lấy các thay đổi từ upstream
+        run: git fetch upstream
+
+      # Bước 4: Hợp nhất (merge) các thay đổi vào nhánh chính của bạn
+      - name: 4. Hợp nhất (merge) thay đổi từ upstream/main
+        run: |
+          # Cấu hình git user để có thể tạo merge commit nếu cần
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          # Checkout vào nhánh chính của bạn (thường là main hoặc master)
+          git checkout main
+          
+          # Merge các thay đổi từ nhánh main của upstream vào
+          # --no-edit để tự động chấp nhận commit message mặc định khi merge
+          git merge upstream/main --no-edit
+
+      # Bước 5: Đẩy (push) các thay đổi đã hợp nhất lên repository của bạn
+      - name: 5. Đẩy các thay đổi lên fork của bạn
+        run: git push origin main
