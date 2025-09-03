@@ -1,29 +1,21 @@
-name: Sync Fork
+name: Auto Sync Fork
 
 on:
   schedule:
-    - cron: '0 0 * * *' # every 24h
-  workflow_dispatch: # on button click
+    - cron: '0 0 * * *' # Runs daily at midnight UTC
+  workflow_dispatch: # Allows manual triggering
 
 jobs:
   sync:
-
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Fork Sync
-        # You may pin to the exact commit or the version.
-        # uses: tgymnich/fork-sync@0cc6ac48fd51415e7c34e5b8823021bc952a5f5f
-        uses: tgymnich/fork-sync@v1.2.1
+      - name: Sync Fork with Upstream
+        uses: tgymnich/fork-sync@v1.2.1 # Example action, replace with your chosen one
         with:
-          # Owner of the forked repository
-          owner: danny-avila
-          # Token for the github API
+          upstream_owner: 'danny-avila' # Replace with the actual upstream owner
+          upstream_repo: 'LibreChat' # Replace with the actual upstream repository name
+          target_branch: 'main' # Replace with the branch you want to sync
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          # Branch to track
-          head: main
-          # Branch to keep updated
-          base: main
-          
