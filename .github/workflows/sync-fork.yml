@@ -1,16 +1,39 @@
-name: sync-fork
+name: Sync Fork
+
 on:
+  push:
+    branches:
+      - "main"
   schedule:
-    - cron: '0 0 * * *'
-  workflow_dispatch: { }
+    - cron: '0 0 * * *' #every 24h
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  
 jobs:
   sync:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - run: gh repo sync $REPOSITORY -b $BRANCH_NAME
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
-          REPOSITORY: ${{ github.repository }}
-          BRANCH_NAME: ${{ github.ref_name }}
+      - name: Checkout your forked repository
+        uses: actions/checkout@v4
+        with:
+          repository: https://github.com/lehuuhieuak/LibreChat
+          token: ${{ secrets.PAT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Add upstream repository
+        run: |
+          git remote add upstream https://github.com/danny-avila/LibreChat.git
+          git fetch upstream
+
+      - name: Sync with upstream/main
+        run: |
+          git fetch upstream main
+          git checkout -B main origin/main
+          git merge upstream/main
+          git push origin main
+
+      - name: Clean up
+        run: |
+          git remote remove upstream
