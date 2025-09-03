@@ -1,7 +1,5 @@
-# Tên của workflow, sẽ hiển thị trong tab "Actions" của GitHub
-name: syns fork
+name: sync fork
 
-# Cấu hình khi nào workflow sẽ chạy
 on:
   schedule:
     - cron: '0 0 * * *'
@@ -9,28 +7,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Tên của job, bạn có thể đặt tùy ý
   sync:
-    # Sử dụng máy ảo Ubuntu phiên bản mới nhất
     runs-on: ubuntu-latest
 
-    # === BẮT ĐẦU PHẦN SỬA LỖI ===
-    # Cấp quyền cho GITHUB_TOKEN để có thể push code và cập nhật workflows
-    permissions:
-      contents: write
-    # === KẾT THÚC PHẦN SỬA LỖI ===
-
     steps:
-      # Bước 1: Checkout code từ repository của bạn (bản fork)
+      # Bước 1: Checkout code sử dụng PAT để có quyền push
+      # Thay vì dùng GITHUB_TOKEN mặc định, chúng ta dùng PAT đã tạo
       - name: 1. Checkout repository của bạn
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.PAT_TOKEN }} 
           fetch-depth: 0
 
       # Bước 2: Thêm remote trỏ đến repository gốc (upstream)
       - name: 2. Thêm remote upstream
         run: |
-          # THAY THẾ URL BÊN DƯỚI bằng URL của repository gốc mà bạn đã fork
+          # Nhớ thay thế URL này bằng URL repository gốc của bạn
           git remote add upstream https://github.com/danny-avila/LibreChat.git
 
       # Bước 3: Lấy (fetch) các thay đổi từ repository gốc
@@ -43,9 +35,11 @@ jobs:
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
+          # Đảm bảo bạn đang ở đúng nhánh (ví dụ: main)
           git checkout main
           git merge upstream/main --no-edit
 
-      # Bước 5: Đẩy (push) các thay đổi đã hợp nhất lên repository của bạn
+      # Bước 5: Đẩy (push) các thay đổi lên fork của bạn
+      # Lệnh git push mặc định sẽ tự động sử dụng token đã được cung cấp trong bước checkout
       - name: 5. Đẩy các thay đổi lên fork của bạn
         run: git push origin main
