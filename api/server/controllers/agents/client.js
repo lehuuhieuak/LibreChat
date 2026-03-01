@@ -663,6 +663,7 @@ class AgentClient extends BaseClient {
         context,
         balance,
         transactions,
+        messageId: this.responseMessageId,
         conversationId: this.conversationId,
         user: this.user ?? this.options.req.user?.id,
         endpointTokenConfig: this.options.endpointTokenConfig,
@@ -891,9 +892,10 @@ class AgentClient extends BaseClient {
         config.signal = null;
       };
 
+      const hideSequentialOutputs = config.configurable.hide_sequential_outputs;
       await runAgents(initialMessages);
       /** @deprecated Agent Chain */
-      if (config.configurable.hide_sequential_outputs) {
+      if (hideSequentialOutputs) {
         this.contentParts = this.contentParts.filter((part, index) => {
           // Include parts that are either:
           // 1. At or after the finalContentStart index
@@ -1147,6 +1149,7 @@ class AgentClient extends BaseClient {
         model: clientOptions.model,
         balance: balanceConfig,
         transactions: transactionsConfig,
+        messageId: this.responseMessageId,
       }).catch((err) => {
         logger.error(
           '[api/server/controllers/agents/client.js #titleConvo] Error recording collected usage',
@@ -1185,6 +1188,7 @@ class AgentClient extends BaseClient {
           model,
           context,
           balance,
+          messageId: this.responseMessageId,
           conversationId: this.conversationId,
           user: this.user ?? this.options.req.user?.id,
           endpointTokenConfig: this.options.endpointTokenConfig,
@@ -1203,6 +1207,7 @@ class AgentClient extends BaseClient {
             model,
             balance,
             context: 'reasoning',
+            messageId: this.responseMessageId,
             conversationId: this.conversationId,
             user: this.user ?? this.options.req.user?.id,
             endpointTokenConfig: this.options.endpointTokenConfig,
