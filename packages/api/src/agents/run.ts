@@ -20,13 +20,18 @@ import type {
   IState,
   LCTool,
 } from '@librechat/agents';
-import type { Agent, AgentSubagentsConfig, SummarizationConfig } from 'librechat-data-provider';
-import type { BaseMessage } from '@langchain/core/messages';
+import type {
+  Agent,
+  AgentModelParameters,
+  AgentSubagentsConfig,
+  SummarizationConfig,
+} from 'librechat-data-provider';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { AppConfig, IUser } from '@librechat/data-schemas';
 import type * as t from '~/types';
 import { getProviderConfig } from '~/endpoints/config/providers';
-import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { resolveHeaders, createSafeUser } from '~/utils/env';
+import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { isUserProvided } from '~/utils/common';
 
 /** Expected shape of JSON tool search results */
@@ -205,6 +210,10 @@ const customProviders = new Set([
   KnownEndpoints.ollama,
 ]);
 
+function includesOpenRouter(value?: string | null): boolean {
+  return typeof value === 'string' && value.toLowerCase().includes(KnownEndpoints.openrouter);
+}
+
 export function getReasoningKey(
   provider: Providers,
   llmConfig: t.RunLLMConfig,
@@ -214,8 +223,8 @@ export function getReasoningKey(
   if (provider === Providers.GOOGLE) {
     reasoningKey = 'reasoning';
   } else if (
-    llmConfig.configuration?.baseURL?.includes(KnownEndpoints.openrouter) ||
-    (agentEndpoint && agentEndpoint.toLowerCase().includes(KnownEndpoints.openrouter))
+    includesOpenRouter(llmConfig.configuration?.baseURL) ||
+    includesOpenRouter(agentEndpoint)
   ) {
     reasoningKey = 'reasoning';
   } else if (
@@ -273,6 +282,31 @@ function hasUnresolvedPlaceholder(value: string): boolean {
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+const nullableAgentModelParameterKeys = [
+  'temperature',
+  'maxContextTokens',
+  'max_context_tokens',
+  'max_output_tokens',
+  'top_p',
+  'frequency_penalty',
+  'presence_penalty',
+] satisfies Array<keyof AgentModelParameters>;
+
+function normalizeAgentModelParameters(
+  modelParameters: AgentModelParameters | undefined,
+): Partial<AgentModelParameters> | undefined {
+  if (!modelParameters) {
+    return undefined;
+  }
+  const normalized: Partial<AgentModelParameters> = { ...modelParameters };
+  for (const key of nullableAgentModelParameterKeys) {
+    if (normalized[key] === null) {
+      delete normalized[key];
+    }
+  }
+  return normalized;
 }
 
 /**
@@ -398,9 +432,11 @@ function resolveSummarizationProvider(
       },
       rawProvider,
     );
-    const clientOverrides: SummarizationClientOverrides = {
-      ...llmConfig,
-    };
+    const { apiKey: resolvedApiKey, ...llmConfigOverrides } = llmConfig;
+    const clientOverrides: SummarizationClientOverrides = { ...llmConfigOverrides };
+    if (typeof resolvedApiKey === 'string') {
+      clientOverrides.apiKey = resolvedApiKey;
+    }
     if (configOptions) {
       clientOverrides.configuration = configOptions;
     }
@@ -718,14 +754,15 @@ export async function createRun({
       { user, requestBody },
     );
 
-    const llmConfig: t.RunLLMConfig = Object.assign(
+    const modelParameters = normalizeAgentModelParameters(agent.model_parameters);
+    const llmConfig = Object.assign(
       {
         provider,
         streaming,
         streamUsage,
       },
-      agent.model_parameters,
-    );
+      modelParameters,
+    ) as t.RunLLMConfig;
 
     const joinInstructionMap = (map?: Record<string, unknown>) =>
       Object.values(map ?? {})
