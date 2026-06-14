@@ -1,5 +1,5 @@
 const { logger } = require('@librechat/data-schemas');
-const { Constants, ViolationTypes } = require('librechat-data-provider');
+const { Constants, ViolationTypes, isEphemeralAgentId } = require('librechat-data-provider');
 const {
   sendEvent,
   getViolationInfo,
@@ -10,11 +10,12 @@ const {
   decrementPendingRequest,
   sanitizeMessageForTransmit,
   checkAndIncrementPendingRequest,
+  isUnpersistedPreliminaryParent,
 } = require('@librechat/api');
 const { disposeClient, clientRegistry, requestDataMap } = require('~/server/cleanup');
 const { handleAbortError } = require('~/server/middleware');
 const { logViolation } = require('~/cache');
-const { saveMessage, getConvo } = require('~/models');
+const { saveMessage, getMessages, getConvo } = require('~/models');
 
 function createCloseHandler(abortController) {
   return function (manual) {
@@ -101,6 +102,50 @@ function getPreliminaryUserMessage({ messageId, parentMessageId, text }, convers
   };
 }
 
+function getRequestModelSpec(req, endpointOption) {
+  const spec = endpointOption?.spec ?? req.body?.spec;
+  if (typeof spec !== 'string' || spec.length === 0) {
+    return;
+  }
+
+  const list = req.config?.modelSpecs?.list;
+  if (!Array.isArray(list)) {
+    return;
+  }
+
+  return list.find((modelSpec) => modelSpec?.name === spec);
+}
+
+function getModelSpecIconURL(modelSpec) {
+  return modelSpec?.iconURL ?? modelSpec?.preset?.iconURL ?? modelSpec?.preset?.endpoint ?? '';
+}
+
+function getEndpointIconURL(req, endpointOption) {
+  const iconURL =
+    endpointOption?.iconURL ?? getModelSpecIconURL(getRequestModelSpec(req, endpointOption));
+  return iconURL || undefined;
+}
+
+function getEndpointResponseModel(endpointOption) {
+  return endpointOption?.modelOptions?.model || endpointOption?.model_parameters?.model;
+}
+
+function getAgentResponseModel(req, endpointOption) {
+  const agentId = endpointOption?.agent_id || req.body?.agent_id;
+  if (typeof agentId === 'string' && agentId.length > 0 && !isEphemeralAgentId(agentId)) {
+    return agentId;
+  }
+
+  return getEndpointResponseModel(endpointOption);
+}
+
+function rejectPreliminaryParentMessageId(res) {
+  return res.status(409).json({
+    error:
+      'Cannot submit a follow-up while the selected parent response is still being saved. Please wait and try again.',
+  });
+}
+
 /**
  * Resumable Agent Controller - Generation runs independently of HTTP connection.
  * Returns streamId immediately, client subscribes separately via SSE.
@@ -119,6 +164,17 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   } = req.body;
 
   const userId = req.user.id;
+
+  if (
+    await isUnpersistedPreliminaryParent({
+      userId,
+      conversationId: reqConversationId,
+      parentMessageId,
+      getMessages,
+    })
+  ) {
+    return rejectPreliminaryParentMessageId(res);
+  }
 
   /** When to generate the conversation title. `immediate` (default) fires title
    *  generation in parallel with the response, from the user's first message;
@@ -160,15 +216,18 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     await attachConversationCreatedAt(req, { userId, conversationId, isNewConvo });
 
+    const endpointIconURL = getEndpointIconURL(req, endpointOption);
+    const responseModel = getAgentResponseModel(req, endpointOption);
     const preliminaryUserMessage = getPreliminaryUserMessage(req.body, conversationId);
     const preliminaryResponseMessageId = getPreliminaryResponseMessageId(req.body);
-    if (preliminaryUserMessage || preliminaryResponseMessageId) {
-      await GenerationJobManager.updateMetadata(streamId, {
-        conversationId,
-        responseMessageId: preliminaryResponseMessageId,
-        userMessage: preliminaryUserMessage,
-      });
-    }
+    await GenerationJobManager.updateMetadata(streamId, {
+      conversationId,
+      endpoint: endpointOption.endpoint,
+      iconURL: endpointIconURL,
+      model: responseModel,
+      responseMessageId: preliminaryResponseMessageId,
+      userMessage: preliminaryUserMessage,
+    });
 
     // Note: We no longer use res.on('close') to abort since we send JSON immediately.
     // The response closes normally after res.json(), which is not an abort condition.
@@ -218,7 +277,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           isCreatedByUser: false,
           user: userId,
           endpoint: endpointOption.endpoint,
-          model: endpointOption.modelOptions?.model || endpointOption.model_parameters?.model,
+          iconURL: resumeState.iconURL || endpointIconURL,
+          model: resumeState.model || responseModel,
         };
 
         if (req.body?.agent_id) {
@@ -703,6 +763,17 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
   // Match the same logic used for conversationId generation above
   const userId = req.user.id;
 
+  if (
+    await isUnpersistedPreliminaryParent({
+      userId,
+      conversationId: reqConversationId,
+      parentMessageId,
+      getMessages,
+    })
+  ) {
+    return rejectPreliminaryParentMessageId(res);
+  }
+
   await attachConversationCreatedAt(req, { userId, conversationId, isNewConvo });
 
   // Create handler to avoid capturing the entire parent scope
@@ -809,8 +880,8 @@ const _LegacyAgentController = async (req, res, next, initializeClient, addTitle
     // Store endpoint metadata for abort handling
     GenerationJobManager.updateMetadata(streamId, {
       endpoint: endpointOption.endpoint,
-      iconURL: endpointOption.iconURL,
-      model: endpointOption.modelOptions?.model || endpointOption.model_parameters?.model,
+      iconURL: getEndpointIconURL(req, endpointOption),
+      model: getAgentResponseModel(req, endpointOption),
       sender: client?.sender,
     });
 

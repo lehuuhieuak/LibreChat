@@ -16,8 +16,8 @@ import type {
   ISkillFileDocument,
   ISkillSummary,
 } from '~/types/skill';
-import { isValidObjectIdString } from '~/utils/objectId';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
+import { isValidObjectIdString } from '~/utils/objectId';
 import { stripYamlTrailingComment } from '~/utils/yaml';
 import { escapeRegExp } from '~/utils/string';
 import logger from '~/config/winston';
@@ -498,6 +498,8 @@ export type UpdateSkillInput = {
   frontmatter?: Record<string, unknown>;
   category?: string;
   alwaysApply?: boolean;
+  source?: 'inline' | 'github' | 'notion';
+  sourceMetadata?: Record<string, unknown>;
 };
 
 export type GetAuthorSkillByNameParams = {
@@ -622,6 +624,7 @@ export type UpsertSkillFileInput = {
   storageKey?: string;
   storageRegion?: string;
   source: string;
+  sourceMetadata?: Record<string, unknown>;
   mimeType: string;
   bytes: number;
   isExecutable?: boolean;
@@ -855,7 +858,87 @@ export function validateAlwaysApplyInBody(body: string | undefined): ValidationI
   return [];
 }
 
-export function createSkillMethods(mongoose: typeof import('mongoose'), deps: SkillDeps) {
+export function createSkillMethods(
+  mongoose: typeof import('mongoose'),
+  deps: SkillDeps,
+): {
+  createSkill: (data: CreateSkillInput) => Promise<CreateSkillResult>;
+  getSkillById: (id: string | Types.ObjectId) => Promise<(ISkill & { _id: Types.ObjectId }) | null>;
+  getSkillByName: (
+    name: string,
+    accessibleIds: Types.ObjectId[],
+    options?: {
+      /**
+       * Manual paths (`$` popover, always-apply once Phase 5 lands) set
+       * this so a same-name newer `userInvocable: false` duplicate can't
+       * shadow the older user-invocable doc the popover surfaced.
+       * Disable-model-invocation status is irrelevant here — manually-
+       * primed disabled skills are explicitly supported (iter 4).
+       */
+      preferUserInvocable?: boolean;
+      /**
+       * Model paths (`skill` / `read_file` tool handlers) set this so a
+       * same-name newer `disable-model-invocation: true` duplicate can't
+       * shadow the cataloged model-invocable doc. User-invocability is
+       * irrelevant here — `userInvocable: false` skills are model-only
+       * and remain valid model-invocation targets.
+       *
+       * Both flags fall back to the newest match when no preferred doc
+       * exists, so handlers can still fire their explicit-rejection
+       * error paths (e.g. "cannot be invoked by the model" in the
+       * disabled-only case).
+       */
+      preferModelInvocable?: boolean;
+    },
+  ) => Promise<(ISkill & { _id: Types.ObjectId }) | null>;
+  getAuthorSkillByName: (
+    params: GetAuthorSkillByNameParams,
+  ) => Promise<(ISkill & { _id: Types.ObjectId }) | null>;
+  listSkillsByAccess: (params: ListSkillsByAccessParams) => Promise<ListSkillsByAccessResult>;
+  listAlwaysApplySkills: (
+    params: ListAlwaysApplySkillsParams,
+  ) => Promise<ListAlwaysApplySkillsResult>;
+  updateSkill: (params: {
+    id: string;
+    expectedVersion: number;
+    update: UpdateSkillInput;
+  }) => Promise<UpdateSkillResult>;
+  deleteSkill: (id: string) => Promise<{ deleted: boolean }>;
+  deleteUserSkills: (userId: Types.ObjectId | string) => Promise<number>;
+  findSkillBySourceIdentity: (params: {
+    source: 'github' | 'notion';
+    upstreamId: string;
+    tenantId?: string;
+  }) => Promise<(ISkill & { _id: Types.ObjectId }) | null>;
+  listSkillsBySource: (params: {
+    source: 'github' | 'notion';
+    sourceId: string;
+  }) => Promise<Array<ISkill & { _id: Types.ObjectId }>>;
+  listSkillFiles: (
+    skillId: Types.ObjectId | string,
+  ) => Promise<Array<ISkillFile & { _id: Types.ObjectId }>>;
+  upsertSkillFile: (row: UpsertSkillFileInput) => Promise<ISkillFile & { _id: Types.ObjectId }>;
+  deleteSkillFile: (
+    skillId: Types.ObjectId | string,
+    relativePath: string,
+  ) => Promise<{ deleted: boolean }>;
+  getSkillFileByPath: (
+    skillId: Types.ObjectId | string,
+    relativePath: string,
+  ) => Promise<(ISkillFile & { _id: Types.ObjectId }) | null>;
+  updateSkillFileContent: (
+    skillId: Types.ObjectId | string,
+    relativePath: string,
+    update: { content?: string; isBinary?: boolean },
+  ) => Promise<void>;
+  updateSkillFileCodeEnvIds: (
+    updates: Array<{
+      skillId: Types.ObjectId | string;
+      relativePath: string;
+      codeEnvRef: CodeEnvRef;
+    }>,
+  ) => Promise<{ matchedCount: number; modifiedCount: number }>;
+} {
   const { ObjectId } = mongoose.Types;
 
   function buildSkillFilter(
@@ -1278,6 +1361,8 @@ export function createSkillMethods(mongoose: typeof import('mongoose'), deps: Sk
     if (update.displayTitle !== undefined) setPayload.displayTitle = update.displayTitle;
     if (update.description !== undefined) setPayload.description = update.description;
     if (update.body !== undefined) setPayload.body = update.body;
+    if (update.source !== undefined) setPayload.source = update.source;
+    if (update.sourceMetadata !== undefined) setPayload.sourceMetadata = update.sourceMetadata;
     if (update.frontmatter !== undefined) {
       setPayload.frontmatter = update.frontmatter;
       /**
@@ -1429,6 +1514,35 @@ export function createSkillMethods(mongoose: typeof import('mongoose'), deps: Sk
     return res.deletedCount ?? 0;
   }
 
+  async function findSkillBySourceIdentity(params: {
+    source: 'github' | 'notion';
+    upstreamId: string;
+    tenantId?: string;
+  }): Promise<(ISkill & { _id: Types.ObjectId }) | null> {
+    const Skill = mongoose.models.Skill as Model<ISkillDocument>;
+    const tenantFilter: FilterQuery<ISkillDocument> = params.tenantId
+      ? { tenantId: params.tenantId }
+      : { $or: [{ tenantId: { $exists: false } }, { tenantId: null }] };
+    const doc = await Skill.findOne({
+      source: params.source,
+      'sourceMetadata.upstreamId': params.upstreamId,
+      ...tenantFilter,
+    }).lean();
+    return (doc as unknown as (ISkill & { _id: Types.ObjectId }) | null) ?? null;
+  }
+
+  async function listSkillsBySource(params: {
+    source: 'github' | 'notion';
+    sourceId: string;
+  }): Promise<Array<ISkill & { _id: Types.ObjectId }>> {
+    const Skill = mongoose.models.Skill as Model<ISkillDocument>;
+    const rows = await Skill.find({
+      source: params.source,
+      'sourceMetadata.sourceId': params.sourceId,
+    }).lean();
+    return rows as unknown as Array<ISkill & { _id: Types.ObjectId }>;
+  }
+
   /**
    * Atomically bumps `Skill.version` and adjusts `fileCount` by `delta`.
    * `delta` is `+1` when a new file is inserted, `-1` when one is deleted, and
@@ -1497,6 +1611,7 @@ export function createSkillMethods(mongoose: typeof import('mongoose'), deps: Sk
           storageKey: row.storageKey,
           storageRegion: row.storageRegion,
           source: row.source,
+          sourceMetadata: row.sourceMetadata,
           mimeType: row.mimeType,
           bytes: row.bytes,
           category,
@@ -1593,6 +1708,8 @@ export function createSkillMethods(mongoose: typeof import('mongoose'), deps: Sk
     updateSkill,
     deleteSkill,
     deleteUserSkills,
+    findSkillBySourceIdentity,
+    listSkillsBySource,
     listSkillFiles,
     upsertSkillFile,
     deleteSkillFile,

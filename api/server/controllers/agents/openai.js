@@ -25,6 +25,7 @@ const {
   recordCollectedUsage,
   getTransactionsConfig,
   resolveRecursionLimit,
+  findPiiMatchInMessages,
   discoverConnectedAgents,
   getRemoteAgentPermissions,
   createToolExecuteHandler,
@@ -174,6 +175,17 @@ const OpenAIChatCompletionController = async (req, res) => {
       `Agent not found: ${agentId}`,
       'invalid_request_error',
       'model_not_found',
+    );
+  }
+
+  const piiHit = findPiiMatchInMessages(request.messages, appConfig?.messageFilter?.pii);
+  if (piiHit != null) {
+    return sendErrorResponse(
+      res,
+      400,
+      `Message contains a ${piiHit.label}. Remove it and try again.`,
+      'invalid_request_error',
+      'message_filter_pii_block',
     );
   }
 
@@ -336,6 +348,7 @@ const OpenAIChatCompletionController = async (req, res) => {
      * @type {Map<string, {
      *   agent: object,
      *   toolRegistry?: import('@librechat/agents').LCToolRegistry,
+     *   requestScopedConnections?: import('@librechat/api').RequestScopedMCPConnectionStore,
      *   userMCPAuthMap?: Record<string, Record<string, string>>,
      *   tool_resources?: object,
      *   actionsEnabled?: boolean,
@@ -480,6 +493,8 @@ const OpenAIChatCompletionController = async (req, res) => {
           agent: ctx.agent ?? agent,
           signal: abortController.signal,
           toolRegistry: ctx.toolRegistry,
+          mcpAvailableTools: ctx.mcpAvailableTools,
+          requestScopedConnections: ctx.requestScopedConnections,
           userMCPAuthMap: ctx.userMCPAuthMap,
           tool_resources: ctx.tool_resources,
           actionsEnabled: ctx.actionsEnabled,

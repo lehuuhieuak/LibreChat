@@ -19,6 +19,7 @@ const mockFilterPersistableAbortContent = jest.fn((content) =>
   content.filter((part) => part?.type !== 'tool_call'),
 );
 const mockGetConvo = jest.fn();
+const mockGetMessages = jest.fn();
 const mockSaveMessage = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -35,6 +36,24 @@ jest.mock('@librechat/api', () => ({
   decrementPendingRequest: (...args) => mockDecrementPendingRequest(...args),
   sanitizeMessageForTransmit: jest.fn((message) => message),
   checkAndIncrementPendingRequest: (...args) => mockCheckAndIncrementPendingRequest(...args),
+  isUnpersistedPreliminaryParent: async ({
+    userId,
+    conversationId,
+    parentMessageId,
+    getMessages,
+  }) => {
+    if (typeof parentMessageId !== 'string' || !parentMessageId.endsWith('_')) {
+      return false;
+    }
+
+    const filter = { user: userId, messageId: parentMessageId };
+    if (conversationId && conversationId !== 'new') {
+      filter.conversationId = conversationId;
+    }
+
+    const messages = await getMessages(filter, '_id');
+    return messages.length === 0;
+  },
 }));
 
 jest.mock('~/server/cleanup', () => ({
@@ -55,6 +74,7 @@ jest.mock('~/cache', () => ({
 
 jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
+  getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
 }));
 
@@ -66,6 +86,7 @@ describe('ResumableAgentController resume metadata', () => {
     mockCheckAndIncrementPendingRequest.mockResolvedValue({ allowed: true });
     mockDecrementPendingRequest.mockResolvedValue(undefined);
     mockGetConvo.mockResolvedValue({ createdAt: '2026-06-07T00:00:00.000Z' });
+    mockGetMessages.mockResolvedValue([]);
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 1000,
       readyPromise: Promise.resolve(),
@@ -78,15 +99,55 @@ describe('ResumableAgentController resume metadata', () => {
     mockSaveMessage.mockResolvedValue({});
   });
 
-  it('stores the in-flight turn before MCP initialization can emit OAuth', async () => {
+  it('rejects an underscore-suffixed parent that is not persisted', async () => {
     const conversationId = 'conversation-123';
+    const initializeClient = jest.fn();
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Follow up too early.',
+        messageId: 'follow-up-user',
+        parentMessageId: 'pending-response_',
+        conversationId,
+        endpointOption: {
+          endpoint: 'agents',
+          modelOptions: { model: 'gpt-3.5-turbo' },
+        },
+      },
+      config: {},
+    };
+    const res = {
+      json: jest.fn(),
+      status: jest.fn(() => res),
+    };
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+
+    expect(mockGetMessages).toHaveBeenCalledWith(
+      { user: 'user-123', messageId: 'pending-response_', conversationId },
+      '_id',
+    );
+    expect(res.status).toHaveBeenCalledWith(409);
+    expect(res.json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        error: expect.stringContaining('selected parent response is still being saved'),
+      }),
+    );
+    expect(mockCheckAndIncrementPendingRequest).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.createJob).not.toHaveBeenCalled();
+    expect(initializeClient).not.toHaveBeenCalled();
+  });
+
+  it('allows an underscore-suffixed parent when it is already persisted', async () => {
+    const conversationId = 'conversation-123';
+    mockGetMessages.mockResolvedValue([{ _id: 'persisted-parent' }]);
     const initializeClient = jest.fn().mockRejectedValue(new Error('stop before tool loading'));
     const req = {
       user: { id: 'user-123' },
       body: {
-        text: 'Check Google Workspace availability.',
+        text: 'Follow up to persisted underscore id.',
         messageId: 'follow-up-user',
-        parentMessageId: 'original-response',
+        parentMessageId: 'persisted-response_',
         conversationId,
         endpointOption: {
           endpoint: 'agents',
@@ -105,18 +166,163 @@ describe('ResumableAgentController resume metadata', () => {
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
 
-    expect(mockGenerationJobManager.updateMetadata).toHaveBeenCalledWith(conversationId, {
+    expect(mockGetMessages).toHaveBeenCalledWith(
+      { user: 'user-123', messageId: 'persisted-response_', conversationId },
+      '_id',
+    );
+    expect(res.status).not.toHaveBeenCalledWith(409);
+    expect(mockCheckAndIncrementPendingRequest).toHaveBeenCalledWith('user-123');
+    expect(mockGenerationJobManager.createJob).toHaveBeenCalledWith(
       conversationId,
-      responseMessageId: 'follow-up-user_',
-      userMessage: {
+      'user-123',
+      conversationId,
+    );
+  });
+
+  it('stores the in-flight turn before MCP initialization can emit OAuth', async () => {
+    const conversationId = 'conversation-123';
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop before tool loading'));
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Check Google Workspace availability.',
         messageId: 'follow-up-user',
         parentMessageId: 'original-response',
         conversationId,
-        text: 'Check Google Workspace availability.',
+        endpointOption: {
+          endpoint: 'agents',
+          iconURL: 'https://example.com/spec-icon.png',
+          modelOptions: { model: 'gpt-3.5-turbo' },
+        },
       },
-    });
+      config: {},
+    };
+    const res = {
+      headersSent: true,
+      json: jest.fn(() => {
+        res.headersSent = true;
+      }),
+      status: jest.fn(() => res),
+    };
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+
+    expect(mockGenerationJobManager.updateMetadata).toHaveBeenCalledWith(
+      conversationId,
+      expect.objectContaining({
+        conversationId,
+        endpoint: 'agents',
+        iconURL: 'https://example.com/spec-icon.png',
+        model: 'gpt-3.5-turbo',
+        responseMessageId: 'follow-up-user_',
+        userMessage: {
+          messageId: 'follow-up-user',
+          parentMessageId: 'original-response',
+          conversationId,
+          text: 'Check Google Workspace availability.',
+        },
+      }),
+    );
     expect(mockGenerationJobManager.updateMetadata.mock.invocationCallOrder[0]).toBeLessThan(
       initializeClient.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('stores model spec icon fallbacks and agent ids in early resume metadata', async () => {
+    const conversationId = 'conversation-123';
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop before tool loading'));
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Use the resume spec.',
+        messageId: 'follow-up-user',
+        parentMessageId: 'original-response',
+        conversationId,
+        endpointOption: {
+          endpoint: 'agents',
+          spec: 'agent-spec',
+          agent_id: 'agent_resume_spec',
+          model_parameters: { model: 'gpt-4.1' },
+        },
+      },
+      config: {
+        modelSpecs: {
+          list: [
+            {
+              name: 'agent-spec',
+              preset: {
+                endpoint: 'openAI',
+                iconURL: 'https://example.com/preset-icon.png',
+              },
+            },
+          ],
+        },
+      },
+    };
+    const res = {
+      headersSent: true,
+      json: jest.fn(() => {
+        res.headersSent = true;
+      }),
+      status: jest.fn(() => res),
+    };
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+
+    expect(mockGenerationJobManager.updateMetadata).toHaveBeenCalledWith(
+      conversationId,
+      expect.objectContaining({
+        iconURL: 'https://example.com/preset-icon.png',
+        model: 'agent_resume_spec',
+      }),
+    );
+  });
+
+  it('falls back to the model spec preset endpoint when no icon URL is configured', async () => {
+    const conversationId = 'conversation-123';
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop before tool loading'));
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Use the endpoint icon.',
+        messageId: 'follow-up-user',
+        parentMessageId: 'original-response',
+        conversationId,
+        endpointOption: {
+          endpoint: 'agents',
+          spec: 'endpoint-icon-spec',
+          model_parameters: { model: 'gpt-4.1' },
+        },
+      },
+      config: {
+        modelSpecs: {
+          list: [
+            {
+              name: 'endpoint-icon-spec',
+              preset: {
+                endpoint: 'anthropic',
+              },
+            },
+          ],
+        },
+      },
+    };
+    const res = {
+      headersSent: true,
+      json: jest.fn(() => {
+        res.headersSent = true;
+      }),
+      status: jest.fn(() => res),
+    };
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+
+    expect(mockGenerationJobManager.updateMetadata).toHaveBeenCalledWith(
+      conversationId,
+      expect.objectContaining({
+        iconURL: 'anthropic',
+        model: 'gpt-4.1',
+      }),
     );
   });
 
@@ -138,6 +344,8 @@ describe('ResumableAgentController resume metadata', () => {
     mockGenerationJobManager.getResumeState.mockResolvedValue({
       conversationId,
       responseMessageId: 'response-message',
+      iconURL: 'https://example.com/spec-icon.png',
+      model: 'gpt-4.1',
       userMessage: {
         messageId: 'user-message',
         parentMessageId: 'parent-message',
@@ -156,6 +364,7 @@ describe('ResumableAgentController resume metadata', () => {
         conversationId,
         endpointOption: {
           endpoint: 'agents',
+          iconURL: 'https://example.com/fallback-icon.png',
           modelOptions: { model: 'gpt-3.5-turbo' },
         },
       },
@@ -188,6 +397,90 @@ describe('ResumableAgentController resume metadata', () => {
       expect.objectContaining({ userId: 'user-123' }),
       expect.objectContaining({
         content: [textPart],
+        iconURL: 'https://example.com/spec-icon.png',
+        model: 'gpt-4.1',
+        messageId: 'response-message',
+        parentMessageId: 'user-message',
+      }),
+      expect.any(Object),
+    );
+  });
+
+  it('uses model spec and agent fallbacks when saving partial responses on disconnect', async () => {
+    const conversationId = 'conversation-123';
+    let allSubscribersLeftHandler;
+    mockGenerationJobManager.createJob.mockResolvedValue({
+      createdAt: 1000,
+      readyPromise: Promise.resolve(),
+      abortController: new AbortController(),
+      emitter: {
+        on: jest.fn((event, handler) => {
+          if (event === 'allSubscribersLeft') {
+            allSubscribersLeftHandler = handler;
+          }
+        }),
+      },
+    });
+    mockGenerationJobManager.getResumeState.mockResolvedValue({
+      conversationId,
+      responseMessageId: 'response-message',
+      userMessage: {
+        messageId: 'user-message',
+        parentMessageId: 'parent-message',
+        conversationId,
+        text: 'Use fallback metadata',
+      },
+    });
+
+    const initializeClient = jest.fn().mockRejectedValue(new Error('stop after setup'));
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Use fallback metadata',
+        messageId: 'user-message',
+        parentMessageId: 'parent-message',
+        conversationId,
+        endpointOption: {
+          endpoint: 'agents',
+          spec: 'agent-spec',
+          agent_id: 'agent_resume_spec',
+          model_parameters: { model: 'gpt-4.1' },
+        },
+      },
+      config: {
+        modelSpecs: {
+          list: [
+            {
+              name: 'agent-spec',
+              preset: {
+                endpoint: 'openAI',
+                iconURL: 'https://example.com/preset-icon.png',
+              },
+            },
+          ],
+        },
+      },
+    };
+    const res = {
+      headersSent: true,
+      json: jest.fn(() => {
+        res.headersSent = true;
+      }),
+      status: jest.fn(() => res),
+    };
+
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+    expect(allSubscribersLeftHandler).toEqual(expect.any(Function));
+
+    const textPart = { type: 'text', text: 'Partial response...' };
+    await allSubscribersLeftHandler([textPart]);
+
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: 'user-123' }),
+      expect.objectContaining({
+        content: [textPart],
+        iconURL: 'https://example.com/preset-icon.png',
+        model: 'agent_resume_spec',
         messageId: 'response-message',
         parentMessageId: 'user-message',
       }),
