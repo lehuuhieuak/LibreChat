@@ -46,7 +46,12 @@ export default function Breakdown({ view, showCost, currency }: BreakdownProps) 
     snapshot?.effectiveInstructionTokens ?? breakdown?.instructionTokens ?? 0;
   const systemTokens =
     (breakdown?.systemMessageTokens ?? 0) + (breakdown?.dynamicInstructionTokens ?? 0);
-  const messageTokens = Math.max(0, usedTokens - instructionTokens);
+  /** Summary has its own row, so exclude it (it's part of `usedTokens`) to avoid
+   *  double-counting it inside the Messages row on a summarized turn. */
+  const messageTokens = Math.max(
+    0,
+    usedTokens - instructionTokens - (breakdown?.summaryTokens ?? 0),
+  );
   const freeTokens = maxTokens != null ? Math.max(0, maxTokens - usedTokens) : null;
 
   const groups =
@@ -133,6 +138,13 @@ export default function Breakdown({ view, showCost, currency }: BreakdownProps) 
           </>
         ) : (
           <>
+            {view.branchTotals.summaryBaseline > 0 && (
+              <Row
+                label={localize('com_ui_context_summary')}
+                value={view.branchTotals.summaryBaseline}
+                max={maxTokens}
+              />
+            )}
             <Row label={localize('com_ui_input')} value={view.branchTotals.input} />
             <Row
               label={localize('com_ui_output')}
