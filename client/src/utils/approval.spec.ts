@@ -71,6 +71,37 @@ describe('applyPendingAction — tool_approval', () => {
     });
   });
 
+  it('replaces displayed tool args with the matching action request arguments', () => {
+    const originalArgs = { query: 'original model args' };
+    const rewrittenArgs = { query: 'rewritten by policy hook' };
+    const message = msg({ content: [toolCallPart('tc1', { args: originalArgs })] });
+    const action = toolApprovalAction({
+      payload: {
+        type: 'tool_approval',
+        action_requests: [
+          {
+            name: 'search',
+            arguments: rewrittenArgs,
+            tool_call_id: 'tc1',
+            description: 'Review rewritten search',
+          },
+        ],
+        review_configs: [
+          {
+            action_name: 'search',
+            tool_call_id: 'tc1',
+            allowed_decisions: ['approve', 'reject', 'edit', 'respond'],
+          },
+        ],
+      },
+    });
+
+    const result = applyPendingAction(message, action);
+
+    expect(getToolCall(result.content?.[0] as TMessageContentParts)?.args).toEqual(rewrittenArgs);
+    expect(getToolCall(message.content?.[0] as TMessageContentParts)?.args).toEqual(originalArgs);
+  });
+
   it('leaves a completed tool call (with output) untouched and returns the same message reference', () => {
     const message = msg({ content: [toolCallPart('tc1', { output: 'already ran' })] });
     const result = applyPendingAction(message, toolApprovalAction());
@@ -342,6 +373,31 @@ describe('resolveAskUserQuestionPart', () => {
     expect(getSubmittedAskAnswer('tc1')).toBe('purple');
     expect(getSubmittedAskAnswer('unknown')).toBeUndefined();
     expect(getSubmittedAskAnswer(undefined)).toBeUndefined();
+  });
+
+  it('stamps the exact tool_call when the payload carried tool_call_id (multi-ask turn)', () => {
+    const askToolCallPart = (id: string) =>
+      ({
+        type: 'tool_call',
+        tool_call: { id, name: 'ask_user_question', args: '', type: 'tool_call' },
+      }) as unknown as TMessageContentParts;
+    const base = msg({ content: [askToolCallPart('tc_a'), askToolCallPart('tc_b')] });
+    const withCard = applyPendingAction(
+      base,
+      askAction({
+        actionId: 'a-multi-ask',
+        payload: {
+          type: 'ask_user_question',
+          question: { question: 'Which region?' },
+          tool_call_id: 'tc_a',
+        },
+      }),
+    );
+    const resolved = resolveAskUserQuestionPart(withCard, 'a-multi-ask', 'us-east');
+    const content = resolved.content as Array<{ tool_call?: Record<string, unknown> }>;
+    // Without the id, the newest-unanswered fallback would stamp tc_b.
+    expect(content[0]?.tool_call?.output).toBe('us-east');
+    expect(content[1]?.tool_call?.output).toBeUndefined();
   });
 });
 

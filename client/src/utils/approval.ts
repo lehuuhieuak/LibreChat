@@ -23,6 +23,10 @@ export interface AskUserQuestionPart {
   [ASK_USER_QUESTION]: {
     actionId: string;
     question: Agents.AskUserQuestionRequest;
+    /** The ask tool call that raised the pause (present from
+     *  `@librechat/agents` > 3.3.8) — lets the answer stamp target the exact
+     *  tool-call part in multi-ask turns. */
+    tool_call_id?: string;
   };
 }
 
@@ -95,6 +99,10 @@ function tagApprovalOnPart(
     const reviewConfig = reviewByToolCallId.get(toolCallId);
     nextToolCall = {
       ...nextToolCall,
+      // A PreToolUse hook may replace the model's original args before asking.
+      // The interrupt payload is authoritative so the reviewer sees, edits, and
+      // approves the same arguments the resumed tool will actually execute.
+      args: request.arguments,
       approval: {
         actionId,
         allowed_decisions: reviewConfig?.allowed_decisions ?? [],
@@ -167,7 +175,11 @@ function applyAskUserQuestion(
   const content = Array.isArray(message.content) ? message.content : [];
   const askPart = {
     type: ASK_USER_QUESTION,
-    [ASK_USER_QUESTION]: { actionId, question: payload.question },
+    [ASK_USER_QUESTION]: {
+      actionId,
+      question: payload.question,
+      ...(payload.tool_call_id != null && { tool_call_id: payload.tool_call_id }),
+    },
   } as unknown as TMessageContentParts;
 
   const existingIdx = content.findIndex(
@@ -321,6 +333,10 @@ export function resolveAskUserQuestionPart(
     return message;
   }
   answeredAskActionIds.add(actionId);
+  /** Exact-attribution target when the payload carried the interrupting call's
+   *  id — several ask cards in one turn each resolve their own part. Absent
+   *  (older server/SDK), the newest-unanswered fallback below applies. */
+  const targetToolCallId = syntheticPart[ASK_USER_QUESTION].tool_call_id;
 
   let patched = false;
   const nextContent: TMessageContentParts[] = [];
@@ -336,10 +352,13 @@ export function resolveAskUserQuestionPart(
   for (let i = nextContent.length - 1; i >= 0; i--) {
     const part = nextContent[i] as { type?: string; tool_call?: Agents.ToolCall } | undefined;
     const toolCall = part?.tool_call;
+    if (part?.type !== ContentTypes.TOOL_CALL || toolCall?.name !== ASK_USER_QUESTION) {
+      continue;
+    }
     if (
-      part?.type !== ContentTypes.TOOL_CALL ||
-      toolCall?.name !== ASK_USER_QUESTION ||
-      (typeof toolCall.output === 'string' && toolCall.output.length > 0)
+      targetToolCallId != null
+        ? toolCall.id !== targetToolCallId
+        : typeof toolCall.output === 'string' && toolCall.output.length > 0
     ) {
       continue;
     }
