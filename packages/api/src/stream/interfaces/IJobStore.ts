@@ -1,4 +1,9 @@
-import type { Agents, TFile, TPendingSteer } from 'librechat-data-provider';
+import type {
+  Agents,
+  TFile,
+  TPendingSteer,
+  UserSubmittedMessageFieldPath,
+} from 'librechat-data-provider';
 import type { StandardGraph } from '@librechat/agents';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
@@ -80,6 +85,10 @@ export interface SerializableJobData {
   isRegenerate?: boolean;
   /** Exact normalized MCP placeholder identity for this turn. */
   mcpRequestBody?: MCPRuntimeRequestBody;
+  /** Exact assistant-message fields authored by the user during this running job. */
+  userSubmittedPaths?: string[];
+  /** Exact request-only message fields embedded at caller-authored paths. */
+  userSubmittedMessageFieldPaths?: UserSubmittedMessageFieldPath[];
 
   /**
    * Whether this run has activity labels enabled (per-endpoint
@@ -302,6 +311,8 @@ export type JobMetadataPatch = Partial<
     | 'responseMessageId'
     | 'isRegenerate'
     | 'mcpRequestBody'
+    | 'userSubmittedPaths'
+    | 'userSubmittedMessageFieldPaths'
     | 'sender'
     | 'conversationId'
     | 'userMessage'
@@ -605,6 +616,8 @@ export interface UsageMetadata {
   output_token_details?: {
     /** Reasoning/thinking tokens generated as chain-of-thought (o1, Gemini thinking, etc.) */
     reasoning?: number;
+    /** Alternate provider/runtime alias for reasoning tokens. */
+    reasoning_tokens?: number;
     audio?: number;
   };
 }
@@ -1346,8 +1359,16 @@ export interface IEventTransport {
     options?: {
       /** Hold sequenced events until syncReorderBuffer establishes the replay frontier. */
       deferSequenceDelivery?: boolean;
+      /** After opening a fresh Pub/Sub channel, atomically capture its sequence frontier
+       * and fence delivery so synchronization cannot lose an attachment-time frame. */
+      captureSequenceFrontier?: boolean;
     },
-  ): { unsubscribe: () => void; ready?: Promise<void> };
+  ): {
+    unsubscribe: () => void;
+    ready?: Promise<void>;
+    /** Synchronize only the transport state captured by this concrete subscription. */
+    syncReorderBuffer?: () => void | Promise<void>;
+  };
 
   /**
    * Publish a chunk event.
@@ -1367,6 +1388,12 @@ export interface IEventTransport {
    * `generationId` is optional for compatibility with legacy, untagged publishers.
    */
   emitError(streamId: string, error: string, generationId?: number): void | Promise<void>;
+
+  /** Optional live-view demand marker used by observational streams that do not replay. */
+  renewDemand?(streamId: string, ttlMs: number): void | Promise<void>;
+
+  /** Returns whether at least one live viewer recently renewed demand for this stream. */
+  hasDemand?(streamId: string): boolean | Promise<boolean>;
 
   /**
    * Publish an abort signal to all replicas (Redis mode).
