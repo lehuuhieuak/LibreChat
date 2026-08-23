@@ -14,8 +14,10 @@ export type Conversation = {
 
 export type ConversationListParams = {
   cursor?: string;
+  limit?: number;
   isArchived?: boolean;
-  sortBy?: 'title' | 'createdAt' | 'updatedAt';
+  pinned?: boolean;
+  sortBy?: 'title' | 'createdAt' | 'updatedAt' | 'archivedAt';
   sortDirection?: 'asc' | 'desc';
   tags?: string[];
   search?: string;
@@ -24,7 +26,15 @@ export type ConversationListParams = {
 
 export type MinimalConversation = Pick<
   s.TConversation,
-  'conversationId' | 'endpoint' | 'title' | 'createdAt' | 'updatedAt' | 'user' | 'chatProjectId'
+  | 'conversationId'
+  | 'endpoint'
+  | 'title'
+  | 'createdAt'
+  | 'updatedAt'
+  | 'archivedAt'
+  | 'user'
+  | 'chatProjectId'
+  | 'pinned'
 >;
 
 export type ConversationListResponse = {
@@ -120,6 +130,9 @@ export type MCPTool = {
   name: string;
   pluginKey: string;
   description: string;
+  /** Raw upstream tool name when the model-facing key stripped a redundant
+   *  server-name prefix — gates the agent editor's legacy id migration. */
+  serverToolName?: string;
 };
 
 export type MCPServer = {
@@ -199,6 +212,10 @@ export type ListRolesResponse = {
 
 export interface MCPServerStatus {
   requiresOAuth: boolean;
+  /** The server connects only inside a chat request because its config reads BODY placeholders. */
+  requestScoped?: boolean;
+  /** Whether all declared per-user variables are present for an on-demand connection. */
+  configurationState?: 'configured' | 'needs_configuration';
   connectionState: 'disconnected' | 'connecting' | 'connected' | 'error';
   authorizationState?:
     | 'not_required'
@@ -219,6 +236,8 @@ export interface MCPServerConnectionStatusResponse {
   success: boolean;
   serverName: string;
   requiresOAuth: boolean;
+  requestScoped?: boolean;
+  configurationState?: MCPServerStatus['configurationState'];
   connectionStatus: 'disconnected' | 'connecting' | 'connected' | 'error';
   authorizationState?: MCPServerStatus['authorizationState'];
 }

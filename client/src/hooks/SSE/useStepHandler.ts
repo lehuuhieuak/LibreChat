@@ -7,6 +7,7 @@ import {
   ContentTypes,
   ToolCallTypes,
   getNonEmptyValue,
+  getRunStepDurationMs,
 } from 'librechat-data-provider';
 import type {
   Agents,
@@ -27,8 +28,12 @@ import {
   initSubagentAggregatorState,
   initSubagentTickerState,
 } from '~/utils/subagentContent';
+import {
+  subagentProgressByToolCallId,
+  subagentProgressKey,
+  sandboxStartingByToolCallId,
+} from '~/store';
 import { isAskUserQuestionPart, isAnsweredAskUserQuestionPart } from '~/utils/approval';
-import { subagentProgressByToolCallId, sandboxStartingByToolCallId } from '~/store';
 import { MESSAGE_UPDATE_INTERVAL } from '~/common';
 
 type TUseStepHandler = {
@@ -53,6 +58,7 @@ type TStepEvent =
   | { event: StepEvents.ON_REASONING_DELTA; data: Agents.ReasoningDeltaEvent }
   | { event: StepEvents.ON_RUN_STEP_DELTA; data: Agents.RunStepDeltaEvent }
   | { event: StepEvents.ON_RUN_STEP_COMPLETED; data: { result: Agents.ToolEndEvent } }
+  | { event: StepEvents.ON_RUN_STEP_CLOSED; data: Agents.RunStepClosedEvent }
   | { event: StepEvents.ON_SUMMARIZE_START; data: Agents.SummarizeStartEvent }
   | { event: StepEvents.ON_SUMMARIZE_DELTA; data: Agents.SummarizeDeltaEvent }
   | { event: StepEvents.ON_SUMMARIZE_COMPLETE; data: Agents.SummarizeCompleteEvent }
@@ -67,6 +73,27 @@ type MessageDeltaUpdate = {
 };
 
 type ReasoningDeltaUpdate = { type: ContentTypes.THINK; think: string };
+
+/** Starts a fresh label-revision domain when a different reasoning step
+ * reuses or folds into an existing THINK slot. The step id is stamped before
+ * the first generated title so compacted resume snapshots can still correlate
+ * later label events by identity rather than relying only on a sparse index. */
+function prepareReasoningPartForStep(message: TMessage, index: number, stepId: string): TMessage {
+  const current = message.content?.[index];
+  if (current?.type !== ContentTypes.THINK || current.reasoning_label_step_id === stepId) {
+    return message;
+  }
+  const nextPart = { ...current };
+  delete nextPart.reasoning_label;
+  delete nextPart.reasoning_label_attempts;
+  delete nextPart.reasoning_label_submitted_chars;
+  delete nextPart.reasoning_label_revision;
+  delete nextPart.reasoning_label_status;
+  nextPart.reasoning_label_step_id = stepId;
+  const nextContent = [...(message.content ?? [])];
+  nextContent[index] = nextPart;
+  return { ...message, content: nextContent };
+}
 
 type AllContentTypes =
   | ContentTypes.TEXT
@@ -140,22 +167,22 @@ export default function useStepHandler({
   const pendingDeltaFlushIds = useRef(new Set<string>());
   const pendingDeltaFlushRef = useRef<(() => void) | null>(null);
   /**
-   * Maps `SubagentUpdateEvent.subagentRunId` → parent `tool_call_id`.
-   * Preferred source is `payload.parentToolCallId` (threaded through by the
-   * SDK from `ToolRunnableConfig.toolCall.id`, deterministic). If a host
-   * runs an older SDK that doesn't emit it, we fall back to a temporal
-   * claim: the OLDEST unclaimed `subagent` tool call in the active message.
-   * Forward (oldest-first) iteration matches the order tool calls are
-   * created in, so concurrent spawns map in creation order.
+   * Maps `SubagentUpdateEvent.subagentRunId` → one concrete parent content-part
+   * occurrence. `payload.parentToolCallId` narrows the candidates when present,
+   * but provider IDs are not unique enough to be the atom identity: they may be
+   * reused across messages or even within one message. Forward (oldest-first)
+   * claiming preserves creation order for both modern and legacy envelopes.
    */
-  const subagentRunToToolCallId = useRef(new Map<string, string>());
-  const claimedSubagentToolCallIds = useRef(new Set<string>());
+  const subagentRunToInvocationKey = useRef(new Map<string, string>());
+  const claimedSubagentInvocationKeys = useRef(new Set<string>());
   /**
    * Buffers for envelopes that arrive before their `subagent` tool call is
    * reflected in `messageMap`. Keyed by `subagentRunId`. Once a tool call is
    * claimed we drain the buffer into the Recoil atom in arrival order.
    */
-  const pendingSubagentBuffer = useRef(new Map<string, SubagentUpdateEvent[]>());
+  const pendingSubagentBuffer = useRef(
+    new Map<string, { parentMessageId: string; events: SubagentUpdateEvent[] }>(),
+  );
   /**
    * Tracked atom keys so `clearStepMaps` can reset them. Without this, each
    * subagent invocation leaks an `events: SubagentUpdateEvent[]` array in the
@@ -178,23 +205,23 @@ export default function useStepHandler({
    *  memory past what the structural output requires. */
 
   /**
-   * Attempts to resolve the parent `tool_call_id` for a subagent run, using
-   * the SDK-provided `parentToolCallId` first and falling back to an
-   * oldest-unclaimed temporal claim.
+   * Resolves a subagent run to an occurrence-scoped parent invocation key.
    */
-  const resolveSubagentToolCallId = useCallback(
-    (payload: SubagentUpdateEvent): string | undefined => {
-      const cached = subagentRunToToolCallId.current.get(payload.subagentRunId);
+  const resolveSubagentInvocationKey = useCallback(
+    (payload: SubagentUpdateEvent, parentMessageId: string): string | undefined => {
+      const cached = subagentRunToInvocationKey.current.get(payload.subagentRunId);
       if (cached != null) return cached;
+      if (parentMessageId === '') return undefined;
 
-      if (payload.parentToolCallId) {
-        subagentRunToToolCallId.current.set(payload.subagentRunId, payload.parentToolCallId);
-        claimedSubagentToolCallIds.current.add(payload.parentToolCallId);
-        return payload.parentToolCallId;
-      }
-
-      // Fallback — oldest unclaimed subagent tool call wins.
-      for (const message of messageMap.current.values()) {
+      // Claim one concrete content-part occurrence. Providers can repeat a
+      // tool_call ID even within one assistant message, so raw IDs alone are
+      // not sufficient identity for either the card or its live progress.
+      const preferred = messageMap.current.get(parentMessageId);
+      // `runId` gives us the expected parent message. If that message has not
+      // arrived yet, buffer instead of claiming a same-ID call from another
+      // parallel response; the mapping is permanent once claimed.
+      if (preferred == null) return undefined;
+      for (const [messageId, message] of [[parentMessageId, preferred] as const]) {
         const content = message.content;
         if (!Array.isArray(content)) continue;
         for (let i = 0; i < content.length; i++) {
@@ -206,11 +233,13 @@ export default function useStepHandler({
           if (
             tc?.name === Constants.SUBAGENT &&
             tc.id &&
-            !claimedSubagentToolCallIds.current.has(tc.id)
+            (payload.parentToolCallId == null || tc.id === payload.parentToolCallId) &&
+            !claimedSubagentInvocationKeys.current.has(subagentProgressKey(messageId, tc.id, i))
           ) {
-            subagentRunToToolCallId.current.set(payload.subagentRunId, tc.id);
-            claimedSubagentToolCallIds.current.add(tc.id);
-            return tc.id;
+            const invocationKey = subagentProgressKey(messageId, tc.id, i);
+            subagentRunToInvocationKey.current.set(payload.subagentRunId, invocationKey);
+            claimedSubagentInvocationKeys.current.add(invocationKey);
+            return invocationKey;
           }
         }
       }
@@ -228,24 +257,27 @@ export default function useStepHandler({
    */
   const applySubagentUpdate = useRecoilCallback(
     ({ set }) =>
-      (payload: SubagentUpdateEvent): void => {
-        const toolCallId = resolveSubagentToolCallId(payload);
+      (payload: SubagentUpdateEvent, parentMessageId: string): void => {
+        const invocationKey = resolveSubagentInvocationKey(payload, parentMessageId);
 
-        if (!toolCallId) {
-          const queue = pendingSubagentBuffer.current.get(payload.subagentRunId) ?? [];
-          queue.push(payload);
-          pendingSubagentBuffer.current.set(payload.subagentRunId, queue);
+        if (!invocationKey) {
+          const pending = pendingSubagentBuffer.current.get(payload.subagentRunId) ?? {
+            parentMessageId,
+            events: [],
+          };
+          pending.events.push(payload);
+          pendingSubagentBuffer.current.set(payload.subagentRunId, pending);
           return;
         }
 
-        const buffered = pendingSubagentBuffer.current.get(payload.subagentRunId);
-        if (buffered && buffered.length > 0) {
+        const pending = pendingSubagentBuffer.current.get(payload.subagentRunId);
+        if (pending && pending.events.length > 0) {
           pendingSubagentBuffer.current.delete(payload.subagentRunId);
         }
-        const toApply = buffered ? [...buffered, payload] : [payload];
+        const toApply = pending ? [...pending.events, payload] : [payload];
 
-        knownSubagentAtomKeys.current.add(toolCallId);
-        set(subagentProgressByToolCallId(toolCallId), (prev) => {
+        knownSubagentAtomKeys.current.add(invocationKey);
+        set(subagentProgressByToolCallId(invocationKey), (prev) => {
           /** Fold the batch into both aggregators. Pure functions — they
            *  return a new reference only when something actually changed,
            *  so React bails out of unnecessary re-renders downstream. */
@@ -274,25 +306,25 @@ export default function useStepHandler({
           };
         });
       },
-    [resolveSubagentToolCallId],
+    [resolveSubagentInvocationKey],
   );
 
   /**
    * Resets all accumulated subagent Recoil state. Kept for conversation-
    * switch cleanup (see top-level hook usage) but NOT called from
-   * `clearStepMaps` — the collapsed SubagentCall ticker and its dialog
+   * `clearStepMaps` — the collapsed SubagentCall ticker and its panel
    * read from these atoms to render the child's content parts, and we
    * want that history to remain visible after the stream ends so the
-   * user can reopen the dialog for auditability. The atoms are bounded
-   * per-call (200-event cap) and per-conversation (one atom per
+   * user can reopen the panel for auditability. The atoms are bounded
+   * by aggregated structure and per-conversation (one atom per
    * subagent spawn), so growth is proportional to messages — the same
    * growth profile as the rest of the conversation state.
    */
   const resetSubagentAtoms = useRecoilCallback(
     ({ reset }) =>
       (): void => {
-        for (const toolCallId of knownSubagentAtomKeys.current) {
-          reset(subagentProgressByToolCallId(toolCallId));
+        for (const invocationKey of knownSubagentAtomKeys.current) {
+          reset(subagentProgressByToolCallId(invocationKey));
         }
         knownSubagentAtomKeys.current.clear();
       },
@@ -483,6 +515,7 @@ export default function useStepHandler({
     ) {
       const currentContent = updatedContent[index] as ReasoningDeltaUpdate;
       const update: ReasoningDeltaUpdate = {
+        ...currentContent,
         type: ContentTypes.THINK,
         think: (currentContent.think || '') + contentPart.think,
       };
@@ -992,6 +1025,13 @@ export default function useStepHandler({
             ) {
               submission.editPrefixFirstPartFolded = true;
             }
+            if (phasedContentPart.type === ContentTypes.THINK) {
+              updatedResponse = prepareReasoningPartForStep(
+                updatedResponse,
+                currentIndex,
+                messageDelta.id,
+              );
+            }
             updatedResponse = updateContent(
               updatedResponse,
               currentIndex,
@@ -1050,6 +1090,11 @@ export default function useStepHandler({
             ) {
               submission.editPrefixFirstPartFolded = true;
             }
+            updatedResponse = prepareReasoningPartForStep(
+              updatedResponse,
+              currentIndex,
+              reasoningDelta.id,
+            );
             updatedResponse = updateContent(
               updatedResponse,
               currentIndex,
@@ -1171,10 +1216,74 @@ export default function useStepHandler({
             }),
           );
         }
+      } else if (stepEvent.event === StepEvents.ON_RUN_STEP_CLOSED) {
+        const closed = stepEvent.data;
+        const runStep = stepMap.current.get(closed.id);
+        let responseMessageId = runStep?.runId ?? '';
+        if (responseMessageId === Constants.USE_PRELIM_RESPONSE_MESSAGE_ID) {
+          responseMessageId = submission?.initialResponse?.messageId ?? '';
+          parentMessageId = submission?.initialResponse?.parentMessageId ?? '';
+        }
+
+        /**
+         * A closure for a step this client never saw opened is not an error
+         * worth surfacing — it happens on reconnect, where the replay may
+         * start after the step was created.
+         */
+        if (!runStep || !responseMessageId) {
+          return;
+        }
+
+        const response = messageMap.current.get(responseMessageId);
+        if (!response) {
+          return;
+        }
+
+        const currentIndex = runStep.index + editPrefixOffset;
+        const existing = response.content?.[currentIndex];
+        /**
+         * Only tool calls render a running state, so only they need the
+         * terminal status. Leaving other part types untouched keeps this from
+         * disturbing text or reasoning content.
+         */
+        if (!existing || existing.type !== ContentTypes.TOOL_CALL) {
+          return;
+        }
+
+        const existingToolCall = existing[ContentTypes.TOOL_CALL];
+        if (!existingToolCall) {
+          return;
+        }
+
+        /** Spread conditionally so an unknowable duration leaves any value the
+         *  server already stamped in place, rather than overwriting it with
+         *  `undefined`. */
+        const durationMs = getRunStepDurationMs(closed);
+        const updatedContent = [...(response.content ?? [])];
+        updatedContent[currentIndex] = {
+          ...existing,
+          [ContentTypes.TOOL_CALL]: {
+            ...existingToolCall,
+            runStepStatus: closed.status,
+            ...(durationMs != null && { runStepDurationMs: durationMs }),
+          },
+        };
+
+        const updatedResponse = { ...response, content: updatedContent };
+        messageMap.current.set(responseMessageId, updatedResponse);
+        setMessages(
+          mergeResponseMessage(messages, updatedResponse, responseMessageId, {
+            ensureUserMessage: true,
+          }),
+        );
       } else if (stepEvent.event === StepEvents.ON_SANDBOX_STARTING) {
         setSandboxStarting(stepEvent.data.tool_call_id);
       } else if (stepEvent.event === StepEvents.ON_SUBAGENT_UPDATE) {
-        applySubagentUpdate(stepEvent.data);
+        let responseMessageId = stepEvent.data.runId;
+        if (responseMessageId === Constants.USE_PRELIM_RESPONSE_MESSAGE_ID) {
+          responseMessageId = submission?.initialResponse?.messageId ?? '';
+        }
+        applySubagentUpdate(stepEvent.data, responseMessageId);
       } else if (stepEvent.event === StepEvents.ON_SUMMARIZE_START) {
         announcePolite({ message: 'summarize_started', isStatus: true });
       } else if (stepEvent.event === StepEvents.ON_SUMMARIZE_DELTA) {
@@ -1325,8 +1434,8 @@ export default function useStepHandler({
     messageMap.current.clear();
     stepMap.current.clear();
     pendingDeltaBuffer.current.clear();
-    subagentRunToToolCallId.current.clear();
-    claimedSubagentToolCallIds.current.clear();
+    subagentRunToInvocationKey.current.clear();
+    claimedSubagentInvocationKeys.current.clear();
     pendingSubagentBuffer.current.clear();
     /** Unlike subagent atoms below, sandbox-starting flags are transient
      *  status with no audit value — reset them at this boundary so an
@@ -1348,11 +1457,22 @@ export default function useStepHandler({
    * Call this after receiving sync event to ensure subsequent deltas
    * build on the synced content, not stale content.
    */
-  const syncStepMessage = useCallback((message: TMessage) => {
-    if (message?.messageId) {
+  const syncStepMessage = useCallback(
+    (message: TMessage) => {
+      if (!message?.messageId) return;
       messageMap.current.set(message.messageId, { ...message });
-    }
-  }, []);
+      const ready = [...pendingSubagentBuffer.current.entries()].filter(
+        ([, pending]) => pending.parentMessageId === message.messageId,
+      );
+      for (const [subagentRunId, pending] of ready) {
+        pendingSubagentBuffer.current.delete(subagentRunId);
+        for (const event of pending.events) {
+          applySubagentUpdate(event, message.messageId);
+        }
+      }
+    },
+    [applySubagentUpdate],
+  );
 
   return {
     stepHandler,

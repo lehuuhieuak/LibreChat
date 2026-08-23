@@ -22,6 +22,7 @@ type THoverButtons = {
   isEditing: boolean;
   enterEdit: (cancel?: boolean) => void;
   copyToClipboard: (setIsCopied: React.Dispatch<React.SetStateAction<boolean>>) => void;
+  getCanCopy: () => boolean;
   conversation: TConversation | null;
   isSubmitting: boolean;
   message: TMessage;
@@ -43,6 +44,7 @@ type HoverButtonProps = {
   className?: string;
   buttonStyle?: string;
   dataTestId?: string;
+  disabled?: boolean;
 };
 
 const extractMessageContent = (message: TMessage): string => {
@@ -87,6 +89,7 @@ const HoverButton = memo(
     isLast = false,
     className = '',
     dataTestId,
+    disabled = false,
   }: HoverButtonProps) => {
     const buttonStyle = hoverButtonClasses({ isActive, isLast, className });
 
@@ -102,6 +105,7 @@ const HoverButton = memo(
             aria-label={title}
             className={buttonStyle}
             onClick={onClick}
+            disabled={disabled}
           >
             {icon}
           </Button>
@@ -118,6 +122,7 @@ const HoverButtons = ({
   isEditing,
   enterEdit,
   copyToClipboard,
+  getCanCopy,
   conversation,
   isSubmitting,
   message,
@@ -159,11 +164,17 @@ const HoverButtons = ({
     isEditableEndpoint,
   } = generationCapabilities;
 
+  const canCopy = useMemo(
+    () => !isActiveStreamingMessage && getCanCopy(),
+    [isActiveStreamingMessage, getCanCopy],
+  );
+
   if (!conversation) {
     return null;
   }
 
   const { isCreatedByUser, error } = message;
+  const isSubagentThreadReadOnly = conversation.subagentThread != null;
 
   const onEdit = () => {
     if (isEditing) {
@@ -205,6 +216,7 @@ const HoverButtons = ({
           }
           icon={isCopied ? <CheckMark className="h-[18px] w-[18px]" /> : <Clipboard size="19" />}
           isLast={isLast}
+          disabled={!canCopy}
           className={cn(
             'ml-0 flex items-center gap-1.5 text-xs',
             isSubmitting && isCreatedByUser
@@ -216,7 +228,7 @@ const HoverButtons = ({
       )}
 
       {/* Edit Button */}
-      {isEditableEndpoint && !hideEditButton && (
+      {!isSubagentThreadReadOnly && isEditableEndpoint && !hideEditButton && (
         <HoverButton
           id={`edit-${message.messageId}`}
           onClick={onEdit}
@@ -245,7 +257,7 @@ const HoverButtons = ({
       )}
 
       {/* Regenerate Button */}
-      {regenerateEnabled && (
+      {!isSubagentThreadReadOnly && regenerateEnabled && (
         <HoverButton
           onClick={regenerate}
           title={localize('com_ui_regenerate')}
@@ -257,7 +269,7 @@ const HoverButtons = ({
       )}
 
       {/* Continue Button */}
-      {continueSupported && (
+      {!isSubagentThreadReadOnly && continueSupported && (
         <HoverButton
           onClick={(e) => e && handleContinue(e)}
           title={localize('com_ui_continue')}

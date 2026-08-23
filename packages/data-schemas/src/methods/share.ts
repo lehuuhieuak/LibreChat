@@ -1,11 +1,16 @@
 import { nanoid } from 'nanoid';
 import { Types } from 'mongoose';
-import { Constants, ContentTypes, FileSources } from 'librechat-data-provider';
+import { Constants, ContentTypes, FileSources, Tools } from 'librechat-data-provider';
 import type { FilterQuery, Model } from 'mongoose';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type * as t from '~/types';
+import {
+  sanitizeUIResourceContent,
+  stripMessageUIResourceMarkers,
+} from '~/utils/stripUIResourceMarkers';
 import { activeExpirationFilter } from '~/utils/retention';
 import { isValidObjectIdString } from '~/utils/objectId';
+import { CLIENT_MESSAGE_SELECT } from './message';
 import logger from '~/config/winston';
 
 class ShareServiceError extends Error {
@@ -118,13 +123,20 @@ function sanitizeSharedFiles(files: unknown): t.SharedFile[] | undefined {
   return sanitized.length > 0 ? sanitized : undefined;
 }
 
+function sanitizeSharedAttachments(attachments: unknown): t.SharedFile[] | undefined {
+  const sanitized = sanitizeSharedFiles(attachments)?.filter(
+    (attachment) => attachment.type !== Tools.ui_resources,
+  );
+  return sanitized && sanitized.length > 0 ? sanitized : undefined;
+}
+
 /**
  * Sources backed by a durable stored object that the share-scoped routes can
  * stream with only `storageKey`/`filepath` + the request. Sources requiring
  * owner-specific credentials (openai/azure assistants, execute_code, vectordb,
  * OCR/parser pipelines) are skipped — those files degrade to a 404 in the share
- * view. `FileSources.text` is intentionally excluded: its `filepath` is a Multer
- * temp path that the upload route deletes, so there is nothing durable to stream.
+ * view. Text-source files are eligible because the share route serves their
+ * database-backed extracted text instead of the deleted Multer temp path.
  */
 const SNAPSHOT_STREAMABLE_SOURCES = new Set<string>([
   FileSources.local,
@@ -132,6 +144,7 @@ const SNAPSHOT_STREAMABLE_SOURCES = new Set<string>([
   FileSources.cloudfront,
   FileSources.azure_blob,
   FileSources.firebase,
+  FileSources.text,
 ]);
 
 /** Collect `file_id`s from a message's `files`/`attachments` array into `target`. */
@@ -346,11 +359,18 @@ function applyShareFileRoute(
   file: t.SharedFile,
   shareId: string,
   snapshotIds: Set<string>,
+  textSourceIds?: Set<string>,
 ): t.SharedFile {
   const fileId = file.file_id;
   if (typeof fileId === 'string' && snapshotIds.has(fileId)) {
     const route = shareFileRoute(shareId, fileId);
-    const next: t.SharedFile = { ...file, filepath: route };
+    const next: t.SharedFile = {
+      ...file,
+      filepath: route,
+      // General storage sources stay private, but `text` is a render semantic:
+      // clients must preview the database-backed payload as text, not the original MIME.
+      ...(textSourceIds?.has(fileId) && { source: FileSources.text }),
+    };
     if (file.preview !== undefined) {
       next.preview = route;
     }
@@ -378,7 +398,9 @@ export function anonymizeSharedContent(
     newMessageId: string;
     shareId: string;
     snapshotIds: Set<string>;
+    textSourceIds?: Set<string>;
     includeFiles: boolean;
+    sanitizeUIResourceMarkers?: boolean;
   },
 ): unknown[] | undefined {
   if (!Array.isArray(content)) {
@@ -386,8 +408,13 @@ export function anonymizeSharedContent(
   }
 
   let result: unknown[] | null = null;
+  const sanitized = sanitizeUIResourceContent(content, params.sanitizeUIResourceMarkers === true);
+  if (sanitized !== content) {
+    result = sanitized as unknown[];
+  }
+
   for (let i = 0; i < content.length; i++) {
-    const part = content[i];
+    const part = result?.[i] ?? content[i];
     if (!isSteerPartWithFiles(part)) {
       continue;
     }
@@ -402,12 +429,11 @@ export function anonymizeSharedContent(
             },
             params.shareId,
             params.snapshotIds,
+            params.textSourceIds,
           ),
         )
       : undefined;
-    if (result == null) {
-      result = [...content];
-    }
+    result ??= [...content];
     result[i] = files ? { ...rest, files } : rest;
   }
   return result ?? content;
@@ -440,6 +466,7 @@ function anonymizeMessages(
   newConvoId: string,
   shareId: string,
   snapshotIds: Set<string>,
+  textSourceIds: Set<string>,
   includeFiles: boolean,
   anonymizeMessageId: (id: string) => string,
   anonymizeAssistantId: (id: string) => string,
@@ -456,7 +483,7 @@ function anonymizeMessages(
     // When files are not shared for this link, omit files/attachments entirely so
     // viewers can't load them through the owner's original (e.g. static) paths.
     const attachments = includeFiles
-      ? sanitizeSharedFiles(message.attachments)?.map((attachment) =>
+      ? sanitizeSharedAttachments(message.attachments)?.map((attachment) =>
           applyShareFileRoute(
             {
               ...attachment,
@@ -465,6 +492,7 @@ function anonymizeMessages(
             },
             shareId,
             snapshotIds,
+            textSourceIds,
           ),
         )
       : undefined;
@@ -480,6 +508,7 @@ function anonymizeMessages(
             },
             shareId,
             snapshotIds,
+            textSourceIds,
           ),
         )
       : undefined;
@@ -492,13 +521,18 @@ function anonymizeMessages(
         anonymizeMessageId(message.parentMessageId || ''),
       conversationId: newConvoId,
       sender: message.sender,
-      text: message.text,
+      text:
+        message.isCreatedByUser === false
+          ? stripMessageUIResourceMarkers(message.text, message.error)
+          : message.text,
       content: anonymizeSharedContent(message.content, {
         newConvoId,
         newMessageId,
         shareId,
         snapshotIds,
+        textSourceIds,
         includeFiles,
+        sanitizeUIResourceMarkers: message.isCreatedByUser !== true,
       }),
       ...(message.iconURL && { iconURL: message.iconURL }),
       ...(model && { model }),
@@ -763,7 +797,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
       const share = (await query
         .populate({
           path: 'messages',
-          select: '-_id -__v -user',
+          select: CLIENT_MESSAGE_SELECT,
         })
         .select('-__v')
         .lean()) as (t.ISharedLink & { messages: t.IMessage[] }) | null;
@@ -810,6 +844,13 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
       const snapshotIds = includeFiles
         ? new Set<string>((fileSnapshots ?? []).map((snapshot) => snapshot.file_id))
         : new Set<string>();
+      const textSourceIds = includeFiles
+        ? new Set<string>(
+            (fileSnapshots ?? [])
+              .filter((snapshot) => snapshot.source === FileSources.text)
+              .map((snapshot) => snapshot.file_id),
+          )
+        : new Set<string>();
       const result: t.SharedMessagesResult = {
         shareId: resolvedShareId,
         title: share.title,
@@ -821,6 +862,7 @@ export function createShareMethods(mongoose: typeof import('mongoose')): {
           newConvoId,
           resolvedShareId,
           snapshotIds,
+          textSourceIds,
           includeFiles,
           anonymizeMessageId,
           anonymizeAssistantId,

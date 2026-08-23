@@ -1,7 +1,7 @@
 import { nanoid } from 'nanoid';
 import mongoose from 'mongoose';
-import { Constants } from 'librechat-data-provider';
 import { MongoMemoryServer } from 'mongodb-memory-server';
+import { Constants, ContentTypes, Tools } from 'librechat-data-provider';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type * as t from '~/types';
 import { createShareMethods, anonymizeSharedContent, type ShareMethods } from './share';
@@ -521,6 +521,133 @@ describe('Share Methods', () => {
       ).toBe(result?.conversationId);
     });
 
+    test('strips MCP-UI attachments from public shared messages', async () => {
+      const userId = new mongoose.Types.ObjectId().toString();
+      const conversationId = `conv_${nanoid()}`;
+      const shareId = `share_${nanoid()}`;
+
+      const message = await Message.create({
+        messageId: `msg_${nanoid()}`,
+        conversationId,
+        user: userId,
+        text: '\\ui{malicious}',
+        isCreatedByUser: false,
+        content: [
+          { type: ContentTypes.TEXT, text: 'Before \\ui{malicious} after' },
+          { type: ContentTypes.TEXT, text: '`\\ui{literal}`' },
+          {
+            type: ContentTypes.TEXT,
+            text: {
+              value: 'Object \\ui{malicious} value',
+              annotations: [{ type: 'citation' }],
+            },
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              subagent_content: [
+                { type: ContentTypes.TEXT, text: 'Nested \\ui{malicious} content' },
+              ],
+            },
+          },
+        ],
+        attachments: [
+          {
+            type: Tools.ui_resources,
+            [Tools.ui_resources]: [
+              {
+                resourceId: 'malicious',
+                mimeType: 'application/vnd.mcp-ui.remote-dom+javascript',
+                text: "root.innerHTML='<img src=x onerror=alert(window.origin)>'",
+              },
+            ],
+          },
+          { type: Tools.web_search, [Tools.web_search]: { results: [] } },
+        ],
+      });
+
+      await SharedLink.create({
+        shareId,
+        conversationId,
+        user: userId,
+        messages: [message._id],
+      });
+
+      const result = await shareMethods.getSharedMessages(shareId);
+
+      expect(result?.messages[0].attachments).toHaveLength(1);
+      expect(result?.messages[0].attachments?.[0].type).toBe(Tools.web_search);
+      expect(result?.messages[0].text).toBe('');
+      expect(result?.messages[0].content).toEqual([
+        { type: ContentTypes.TEXT, text: 'Before  after' },
+        { type: ContentTypes.TEXT, text: '`\\ui{literal}`' },
+        {
+          type: ContentTypes.TEXT,
+          text: { value: 'Object  value', annotations: [{ type: 'citation' }] },
+        },
+        {
+          type: ContentTypes.TOOL_CALL,
+          tool_call: {
+            subagent_content: [{ type: ContentTypes.TEXT, text: 'Nested  content' }],
+          },
+        },
+      ]);
+    });
+
+    test.each([true, null])(
+      'matches text and content renderers for author flag %s in public shares',
+      async (authorFlag) => {
+        const userId = new mongoose.Types.ObjectId().toString();
+        const conversationId = `conv_${nanoid()}`;
+        const shareId = `share_${nanoid()}`;
+
+        const message = await Message.create({
+          messageId: `msg_${nanoid()}`,
+          conversationId,
+          user: userId,
+          text: 'Example: \\ui{literal}',
+          isCreatedByUser: authorFlag,
+          content: [
+            { type: ContentTypes.TEXT, text: 'Part: \\ui{literal}' },
+            {
+              type: ContentTypes.TOOL_CALL,
+              tool_call: {
+                name: Constants.SUBAGENT,
+                output: 'Legacy \\ui{nested} output',
+                subagent_content: [{ type: ContentTypes.TEXT, text: 'Nested \\ui{nested} text' }],
+              },
+            },
+          ],
+          attachments: [{ type: Tools.ui_resources, [Tools.ui_resources]: [] }],
+        });
+        await SharedLink.create({
+          shareId,
+          conversationId,
+          user: userId,
+          messages: [message._id],
+        });
+
+        const result = await shareMethods.getSharedMessages(shareId);
+
+        expect(result?.messages[0].text).toBe('Example: \\ui{literal}');
+        expect(result?.messages[0].content).toEqual([
+          {
+            type: ContentTypes.TEXT,
+            text: authorFlag === true ? 'Part: \\ui{literal}' : 'Part: ',
+          },
+          {
+            type: ContentTypes.TOOL_CALL,
+            tool_call: {
+              name: Constants.SUBAGENT,
+              output: 'Legacy  output',
+              subagent_content: [{ type: ContentTypes.TEXT, text: 'Nested  text' }],
+            },
+          },
+        ]);
+        expect(result?.messages[0].attachments).toBeUndefined();
+      },
+    );
+
     test('strips storage-internal fields while preserving shared render data', async () => {
       const userId = new mongoose.Types.ObjectId().toString();
       const conversationId = `conv_${nanoid()}`;
@@ -741,7 +868,7 @@ describe('Share Methods', () => {
       expect(share?.fileSnapshots?.map((snapshot) => snapshot.file_id)).toContain('steer-file-2');
     });
 
-    test('leaves non-steer content untouched (same array reference when no steer part)', () => {
+    test('leaves safe non-steer content untouched (same array reference)', () => {
       const plainContent = [
         { type: 'text', text: 'no steers here' },
         { type: 'tool_call', tool_call: { id: 'call_1' } },
@@ -2667,11 +2794,15 @@ describe('Share Methods', () => {
       expect(result?.updatedAt?.getTime()).toBe(published?.updatedAt?.getTime());
     });
 
-    test('does not snapshot transient text-source files', async () => {
+    test('snapshots database-backed text-source files without embedding their text', async () => {
       const userId = new mongoose.Types.ObjectId().toString();
       const conversationId = `conv_${nanoid()}`;
       await seedConversation(userId, conversationId);
-      const textId = await createFile(userId, { source: 'text' });
+      const textId = await createFile(userId, {
+        source: 'text',
+        filepath: 'mistral_ocr',
+        text: 'Extracted text',
+      });
       await Message.create({
         messageId: `msg_${nanoid()}`,
         conversationId,
@@ -2683,7 +2814,20 @@ describe('Share Methods', () => {
 
       const result = await shareMethods.createSharedLink(userId, conversationId);
       const saved = await SharedLink.findOne({ shareId: result.shareId }).lean();
-      expect(saved?.fileSnapshots ?? []).toHaveLength(0);
+      expect(saved?.fileSnapshots).toHaveLength(1);
+      expect(saved?.fileSnapshots?.[0]).toMatchObject({
+        file_id: textId,
+        source: 'text',
+        filepath: 'mistral_ocr',
+      });
+      expect(saved?.fileSnapshots?.[0]).not.toHaveProperty('text');
+
+      const shared = await shareMethods.getSharedMessages(result.shareId);
+      expect(shared?.messages[0].files?.[0]).toMatchObject({
+        file_id: textId,
+        source: 'text',
+        filepath: `/api/share/${result.shareId}/files/${textId}`,
+      });
     });
 
     test('updateSharedLink clears snapshots when snapshotFiles is disabled', async () => {

@@ -12,7 +12,12 @@ jest.mock('@librechat/api', () => ({
   sendFeedbackScore: jest.fn().mockResolvedValue(undefined),
   traceIdForMessage: jest.fn((messageId) => `trace-${messageId}`),
   mergeQuotedTextForCount: jest.fn((text) => text),
+  CHILD_THREAD_READ_ONLY_ERROR: 'Child thread is view-only.',
+  isSubagentThreadWriteBlocked: jest.fn().mockResolvedValue(false),
+  requireFeedbackEnabled: (req, res, next) => next(),
 }));
+
+jest.mock('~/server/services/Endpoints/agents/subagentThreadStore', () => ({}));
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
@@ -65,6 +70,7 @@ describe('PUT /:conversationId/:messageId content edit', () => {
   it('preserves content-part metadata when editing its text', async () => {
     getMessages.mockResolvedValue([
       {
+        conversationId: 'conversation-1',
         tokenCount: 10,
         content: [
           {
@@ -98,6 +104,45 @@ describe('PUT /:conversationId/:messageId content edit', () => {
     });
   });
 
+  it('clears the generated reasoning title when its reasoning text is edited', async () => {
+    getMessages.mockResolvedValue([
+      {
+        conversationId: 'conversation-1',
+        tokenCount: 10,
+        content: [
+          {
+            type: ContentTypes.THINK,
+            think: 'Original reasoning',
+            agentId: 'agent-1',
+            reasoning_label: 'Inspecting the original path',
+            reasoning_label_step_id: 'reasoning-step-1',
+            reasoning_label_attempts: 3,
+            reasoning_label_submitted_chars: 18,
+            reasoning_label_revision: 2,
+            reasoning_label_status: 'complete',
+          },
+        ],
+      },
+    ]);
+
+    const response = await request(app)
+      .put('/api/messages/conversation-1/message-1')
+      .send({ index: 0, text: 'Edited reasoning', model: 'gpt-5' });
+
+    expect(response.status).toBe(200);
+    expect(updateMessage).toHaveBeenCalledWith('user-1', {
+      messageId: 'message-1',
+      tokenCount: 10,
+      content: [
+        {
+          type: ContentTypes.THINK,
+          think: 'Edited reasoning',
+          agentId: 'agent-1',
+        },
+      ],
+    });
+  });
+
   /**
    * A text part is `string | { value, annotations }`. The Assistants thread sync
    * persists the structured form with its file citations intact and the editor reads
@@ -114,6 +159,7 @@ describe('PUT /:conversationId/:messageId content edit', () => {
 
     getMessages.mockResolvedValue([
       {
+        conversationId: 'conversation-1',
         tokenCount: 10,
         content: [
           {

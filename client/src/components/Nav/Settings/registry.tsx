@@ -20,24 +20,30 @@ import ConversationModeSwitch from '../SettingsTabs/Speech/ConversationModeSwitc
 import EnableTwoFactorItem from '../SettingsTabs/Account/TwoFactorAuthentication';
 import LangfuseConnection from '../SettingsTabs/Integrations/LangfuseConnection';
 import ImportConversations from '../SettingsTabs/Data/ImportConversations';
+import { ArchiveAllChats } from '../SettingsTabs/Data/ArchiveAllChats';
 import { toggleControl, ThemeSetting, LangSetting } from './controls';
 import BackupCodesItem from '../SettingsTabs/Account/BackupCodesItem';
 import { EngineSTTSetting, EngineTTSSetting } from './SpeechControls';
 import FontSizeSelector from '../SettingsTabs/Chat/FontSizeSelector';
+import ChatTitleInTab from '../SettingsTabs/General/ChatTitleInTab';
 import AdvancedPrompts from '../SettingsTabs/Chat/AdvancedPrompts';
 import DuringRunAction from '../SettingsTabs/Chat/DuringRunAction';
 import DeleteAccount from '../SettingsTabs/Account/DeleteAccount';
+import StatefulWorkspaceDefault from './StatefulWorkspaceDefault';
 import { ForkSettings } from '../SettingsTabs/Chat/ForkSettings';
 import ChatDirection from '../SettingsTabs/Chat/ChatDirection';
 import { DeleteCache } from '../SettingsTabs/Data/DeleteCache';
+import { ManageFiles } from '../SettingsTabs/Data/ManageFiles';
 import { smoothStreamingAtom } from '~/store/smoothStreaming';
 import { RevokeKeys } from '../SettingsTabs/Data/RevokeKeys';
 import { ClearChats } from '../SettingsTabs/Data/ClearChats';
 import { TokenCredits, AutoRefill } from './BillingControls';
 import AdminPanel from '../SettingsTabs/General/AdminPanel';
 import SharedLinks from '../SettingsTabs/Data/SharedLinks';
+import ImageResize from '../SettingsTabs/Chat/ImageResize';
 import { showThinkingAtom } from '~/store/showThinking';
 import ProviderKeys from '../SettingsTabs/ProviderKeys';
+import { autoScrollAtom } from '~/store/autoScroll';
 import Avatar from '../SettingsTabs/Account/Avatar';
 import About from '../SettingsTabs/About/About';
 import ApiKeys from '../SettingsTabs/ApiKeys';
@@ -115,6 +121,14 @@ export const registry: SettingEntry[] = [
       switchId: 'showScrollButton',
     }),
   },
+  {
+    id: 'chatTitleInTab',
+    tab: GENERAL,
+    section: 'layout',
+    labelKey: 'com_nav_chat_title_in_tab',
+    keywords: ['tab', 'title', 'browser', 'window'],
+    Component: ChatTitleInTab,
+  },
   // General · Accessibility
   {
     id: 'keepScreenAwake',
@@ -186,6 +200,27 @@ export const registry: SettingEntry[] = [
     }),
   },
   {
+    id: 'clientImageResize',
+    tab: CHAT,
+    section: 'sending',
+    labelKey: 'com_nav_client_image_resize',
+    keywords: ['image', 'resize', 'compress', 'upload', 'attachment', 'photo'],
+    Component: ImageResize,
+  },
+  {
+    id: 'pasteLongTextAsFile',
+    tab: CHAT,
+    section: 'sending',
+    labelKey: 'com_nav_paste_long_text_as_file',
+    keywords: ['paste', 'clipboard', 'attachment', 'file', 'text'],
+    Component: toggleControl({
+      stateAtom: store.pasteLongTextAsFile,
+      localizationKey: 'com_nav_paste_long_text_as_file',
+      switchId: 'pasteLongTextAsFile',
+      hoverCardText: 'com_nav_info_paste_long_text_as_file',
+    }),
+  },
+  {
     id: 'saveBadgesState',
     tab: CHAT,
     section: 'sending',
@@ -243,6 +278,19 @@ export const registry: SettingEntry[] = [
       stateAtom: store.enableUserMsgMarkdown,
       localizationKey: 'com_nav_user_msg_markdown',
       switchId: 'enableUserMsgMarkdown',
+    }),
+  },
+  {
+    id: 'collapseLongUserMessages',
+    tab: CHAT,
+    section: 'messages',
+    labelKey: 'com_nav_collapse_user_messages',
+    keywords: ['collapse', 'expand', 'long', 'user', 'message', 'truncate', 'show', 'more'],
+    Component: toggleControl({
+      stateAtom: store.collapseLongUserMessages,
+      localizationKey: 'com_nav_collapse_user_messages',
+      switchId: 'collapseLongUserMessages',
+      hoverCardText: 'com_nav_info_collapse_user_messages',
     }),
   },
   {
@@ -318,7 +366,7 @@ export const registry: SettingEntry[] = [
     section: 'conversations',
     labelKey: 'com_nav_auto_scroll',
     Component: toggleControl({
-      stateAtom: store.autoScroll,
+      stateAtom: autoScrollAtom,
       localizationKey: 'com_nav_auto_scroll',
       switchId: 'autoScroll',
     }),
@@ -499,6 +547,16 @@ export const registry: SettingEntry[] = [
     show: (ctx) => ctx.hasMemoryOptOut,
     Component: MemoryToggle,
   },
+  // Data controls · Code execution
+  {
+    id: 'defaultStatefulWorkspace',
+    tab: DATA,
+    section: 'codeExecution',
+    labelKey: 'com_ui_default_stateful_workspace',
+    keywords: ['agent', 'code', 'environment', 'sandbox', 'stateful', 'workspace'],
+    show: (ctx) => ctx.hasStatefulCodeSessions,
+    Component: StatefulWorkspaceDefault,
+  },
   // Data controls · Your data
   {
     id: 'importConversations',
@@ -513,6 +571,22 @@ export const registry: SettingEntry[] = [
     section: 'data',
     labelKey: 'com_ui_settings_label_shared_links',
     Component: SharedLinks,
+  },
+  {
+    id: 'manageFiles',
+    tab: DATA,
+    section: 'data',
+    labelKey: 'com_ui_settings_label_manage_files',
+    keywords: ['file', 'files', 'upload', 'uploads', 'storage', 'attachments'],
+    Component: ManageFiles,
+  },
+  {
+    id: 'archiveAllChats',
+    tab: DATA,
+    section: 'data',
+    labelKey: 'com_ui_settings_label_archive_all_chats',
+    keywords: ['archive', 'chats', 'conversations', 'bulk'],
+    Component: ArchiveAllChats,
   },
   // Data controls · API keys
   {

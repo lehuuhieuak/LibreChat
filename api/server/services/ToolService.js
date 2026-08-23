@@ -35,6 +35,7 @@ const {
   isNormalizationSensitiveName,
   AGENT_EXPECTED_MCP_TOOLS_UNAVAILABLE,
   isFatalAgentInitializationError,
+  resolveCodeExecutionContext,
 } = require('@librechat/api');
 const {
   Time,
@@ -258,6 +259,7 @@ async function processRequiredActions(client, requiredActions) {
     options: {
       processFileURL,
       req: client.req,
+      res: client.res,
       uploadImageBuffer,
       openAIApiKey: client.apiKey,
       returnMetadata: true,
@@ -564,6 +566,7 @@ const isBuiltInTool = (toolName) =>
  * @param {ServerRequest} params.req - The request object
  * @param {ServerResponse} [params.res] - The response object for SSE events
  * @param {Object} params.agent - The agent configuration
+ * @param {import('@librechat/api').RequestBody} [params.requestBody] - Normalized MCP body
  * @param {string} [params.agentResourceType] - Permission resource type for the authorized agent route
  * @param {string|null} [params.streamId] - Stream ID for resumable mode
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted tool events
@@ -579,10 +582,12 @@ async function loadToolDefinitionsWrapper({
   req,
   res,
   agent,
+  requestBody,
   agentResourceType,
   streamId = null,
   jobCreatedAt,
   tool_resources,
+  codeExecutionContext,
   accessibleMcpServerNames,
 }) {
   if (!agent.tools || agent.tools.length === 0) {
@@ -597,6 +602,7 @@ async function loadToolDefinitionsWrapper({
   }
 
   const appConfig = req.config;
+  const runtimeRequestBody = requestBody ?? req.body;
   const hasExpectedMCPTools = agent.tools.some(isExpectedMCPTool);
   const enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent.id);
 
@@ -608,6 +614,18 @@ async function loadToolDefinitionsWrapper({
   const codeExecutionEnabled =
     agent.tools?.includes(Tools.execute_code) === true &&
     enabledCapabilities.has(AgentCapabilities.execute_code);
+  const resolvedCodeExecutionContext =
+    codeExecutionContext ??
+    resolveCodeExecutionContext({
+      statefulSessions:
+        codeExecutionEnabled &&
+        enabledCapabilities.has(AgentCapabilities.stateful_code_sessions) &&
+        agent.stateful_code_sessions === true,
+      environment: agent.stateful_code_environment,
+      userId: req.user.id,
+      agentId: agent.id,
+      conversationId: runtimeRequestBody?.conversationId,
+    });
   const hasMCPTools = agent.tools?.some((tool) => tool?.includes(Constants.mcp_delimiter));
   const mcpPermissionContext = createMCPPermissionContext(req);
   const canUseMCP = hasMCPTools ? await mcpPermissionContext.canUseServers(req.user) : true;
@@ -913,7 +931,7 @@ async function loadToolDefinitionsWrapper({
       serverName,
       configServers,
       userMCPAuthMap,
-      requestBody: req.body,
+      requestBody: runtimeRequestBody,
       requestScopedConnections,
     });
 
@@ -940,7 +958,7 @@ async function loadToolDefinitionsWrapper({
       serverName,
       configServers,
       userMCPAuthMap,
-      requestBody: req.body,
+      requestBody: runtimeRequestBody,
       requestScopedConnections,
     });
 
@@ -1007,7 +1025,7 @@ async function loadToolDefinitionsWrapper({
     return definitions;
   };
 
-  let { toolDefinitions, toolRegistry, hasDeferredTools, mcpResolution } =
+  let { toolDefinitions, toolRegistry, hasDeferredTools, mcpToolAliases, mcpResolution } =
     await loadToolDefinitions(
       {
         userId: req.user.id,
@@ -1068,7 +1086,7 @@ async function loadToolDefinitionsWrapper({
           configServers,
           userMCPAuthMap,
           flowManager,
-          requestBody: req.body,
+          requestBody: runtimeRequestBody,
           returnOnOAuth: false,
           oauthStart,
           oauthEnd: createOAuthEndEmitter(serverName),
@@ -1120,6 +1138,7 @@ async function loadToolDefinitionsWrapper({
       toolDefinitions = reloadResult.toolDefinitions;
       toolRegistry = reloadResult.toolRegistry;
       hasDeferredTools = reloadResult.hasDeferredTools;
+      mcpToolAliases = reloadResult.mcpToolAliases;
       mcpResolution = reloadResult.mcpResolution;
     }
   }
@@ -1158,6 +1177,8 @@ async function loadToolDefinitionsWrapper({
         tool_resources,
         agentId: agent.id,
         agentResourceType,
+        codeApiBaseUrl: resolvedCodeExecutionContext.baseUrl,
+        executionProfile: resolvedCodeExecutionContext.executionProfile,
       });
       if (toolContext) {
         dynamicToolContextMap[Tools.execute_code] = toolContext;
@@ -1226,6 +1247,7 @@ async function loadToolDefinitionsWrapper({
     dynamicToolContextMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpToolAliases,
     actionsEnabled,
     primedCodeFiles,
   };
@@ -1237,6 +1259,7 @@ async function loadToolDefinitionsWrapper({
  * @param {ServerRequest} params.req - The request object
  * @param {ServerResponse} params.res - The response object
  * @param {Object} params.agent - The agent configuration
+ * @param {import('@librechat/api').RequestBody} [params.requestBody] - Normalized MCP body
  * @param {string} [params.agentResourceType] - Permission resource type for the authorized agent route
  * @param {AbortSignal} [params.signal] - Abort signal
  * @param {Object} [params.tool_resources] - Tool resources
@@ -1251,6 +1274,7 @@ async function loadAgentTools({
   req,
   res,
   agent,
+  requestBody,
   agentResourceType,
   signal,
   tool_resources,
@@ -1258,6 +1282,7 @@ async function loadAgentTools({
   streamId = null,
   jobCreatedAt,
   definitionsOnly = true,
+  codeExecutionContext: providedCodeExecutionContext,
   accessibleMcpServerNames,
 }) {
   if (definitionsOnly) {
@@ -1266,10 +1291,12 @@ async function loadAgentTools({
         req,
         res,
         agent,
+        requestBody,
         agentResourceType,
         streamId,
         jobCreatedAt,
         tool_resources,
+        codeExecutionContext: providedCodeExecutionContext,
         accessibleMcpServerNames,
       });
     } catch (error) {
@@ -1368,6 +1395,23 @@ async function loadAgentTools({
     });
   }
 
+  const codeExecutionEnabled =
+    agent.tools?.includes(Tools.execute_code) === true &&
+    enabledCapabilities.has(AgentCapabilities.execute_code);
+  const statefulCodeSessions =
+    codeExecutionEnabled &&
+    enabledCapabilities.has(AgentCapabilities.stateful_code_sessions) &&
+    agent.stateful_code_sessions === true;
+  const codeExecutionContext =
+    providedCodeExecutionContext ??
+    resolveCodeExecutionContext({
+      statefulSessions: statefulCodeSessions,
+      environment: agent.stateful_code_environment,
+      userId: req.user.id,
+      agentId: agent.id,
+      conversationId: requestBody?.conversationId ?? req.body?.conversationId,
+    });
+
   const { loadedTools, toolContextMap, dynamicToolContextMap, primedCodeFiles } = await loadTools({
     agent,
     signal,
@@ -1378,6 +1422,7 @@ async function loadAgentTools({
     options: {
       req,
       res,
+      requestBody,
       agentResourceType,
       mcpServerContext,
       jobCreatedAt,
@@ -1388,6 +1433,7 @@ async function loadAgentTools({
       returnMetadata: true,
       mcpPermissionContext,
       requestScopedConnections: getMCPRequestContext(req, res),
+      codeExecutionContext,
       [Tools.web_search]: webSearchCallbacks,
     },
     webSearch: appConfig.webSearch,
@@ -1398,10 +1444,7 @@ async function loadAgentTools({
   /** Build tool registry from MCP tools and create PTC/tool search tools if configured */
   const deferredToolsEnabled = checkCapability(AgentCapabilities.deferred_tools);
   const programmaticToolsEnabled = enabledCapabilities.has(AgentCapabilities.programmatic_tools);
-  const codeExecutionEnabled =
-    agent.tools?.includes(Tools.execute_code) === true &&
-    enabledCapabilities.has(AgentCapabilities.execute_code);
-  const { toolRegistry, toolDefinitions, additionalTools, hasDeferredTools } =
+  const { toolRegistry, toolDefinitions, additionalTools, hasDeferredTools, mcpToolAliases } =
     await buildToolClassification({
       loadedTools,
       userId: req.user.id,
@@ -1412,6 +1455,7 @@ async function loadAgentTools({
       programmaticToolsEnabled,
       codeExecutionEnabled,
       authHeaders: () => getCodeApiAuthHeaders(req),
+      codeExecutionContext,
     });
 
   const agentTools = [];
@@ -1470,6 +1514,7 @@ async function loadAgentTools({
       dynamicToolContextMap,
       toolDefinitions,
       hasDeferredTools,
+      mcpToolAliases,
       actionsEnabled,
       tools: agentTools,
       primedCodeFiles,
@@ -1489,6 +1534,7 @@ async function loadAgentTools({
       dynamicToolContextMap,
       toolDefinitions,
       hasDeferredTools,
+      mcpToolAliases,
       actionsEnabled,
       tools: agentTools,
       primedCodeFiles,
@@ -1619,6 +1665,7 @@ async function loadAgentTools({
     userMCPAuthMap,
     toolDefinitions,
     hasDeferredTools,
+    mcpToolAliases,
     actionsEnabled,
     tools: agentTools,
     primedCodeFiles,
@@ -1637,6 +1684,7 @@ async function loadAgentTools({
  * @param {ServerResponse} params.res - The response object
  * @param {AbortSignal} [params.signal] - Abort signal
  * @param {Object} params.agent - The agent object
+ * @param {import('@librechat/api').RequestBody} [params.requestBody] - Normalized MCP body
  * @param {string} [params.agentResourceType] - Permission resource type for the authorized agent route
  * @param {string[]} params.toolNames - Names of tools to load
  * @param {Map} [params.toolRegistry] - Tool registry
@@ -1646,6 +1694,7 @@ async function loadAgentTools({
  * @param {Object} [params.tool_resources] - Tool resources
  * @param {string|null} [params.streamId] - Stream ID for web search callbacks
  * @param {number} [params.jobCreatedAt] - The generation epoch that owns emitted tool events
+ * @param {string} [params.conversationId] - Resolved conversation identity for this request
  * @param {boolean} [params.actionsEnabled] - Whether the actions capability is enabled
  * @param {readonly string[]} [params.accessibleMcpServerNames] - COMPLETE accessible-server audit resolved at initialization
  * @returns {Promise<{ loadedTools: Array, configurable: Object }>}
@@ -1655,6 +1704,7 @@ async function loadToolsForExecution({
   res,
   signal,
   agent,
+  requestBody,
   agentResourceType,
   toolNames,
   toolRegistry,
@@ -1666,13 +1716,19 @@ async function loadToolsForExecution({
   tool_resources,
   streamId = null,
   jobCreatedAt,
+  conversationId,
   actionsEnabled,
   accessibleMcpServerNames,
 }) {
   const appConfig = req.config;
   const allLoadedTools = [];
+  const runtimeRequestBody = requestBody ?? req.body;
   const mcpRequestScopedConnections = requestScopedConnections ?? getMCPRequestContext(req, res);
-  const configurable = { userMCPAuthMap, requestScopedConnections: mcpRequestScopedConnections };
+  const configurable = {
+    userMCPAuthMap,
+    requestBody: runtimeRequestBody,
+    requestScopedConnections: mcpRequestScopedConnections,
+  };
   /** Per-agent set of tools that received the injected `run_in_background`
    *  param; the event-driven executor gates background dispatch and the
    *  `check_background_task` poll tool on this reliable per-agent channel. */
@@ -1695,9 +1751,19 @@ async function loadToolsForExecution({
   const isBashToolRequested = toolNames.includes(AgentConstants.BASH_TOOL);
   const isLegacyExecuteCodeRequested = toolNames.includes(Tools.execute_code);
   const isCodeExecutionToolRequested = isBashToolRequested || isLegacyExecuteCodeRequested;
+  const isSkillToolRequested = toolNames.includes(AgentConstants.SKILL_TOOL);
+  const isSandboxFileToolRequested = toolNames.some((name) =>
+    [AgentConstants.READ_FILE, AgentConstants.CREATE_FILE, AgentConstants.EDIT_FILE].includes(name),
+  );
 
   let enabledCapabilities;
-  if (actionsEnabled === undefined || isPTCRequested || isCodeExecutionToolRequested) {
+  if (
+    actionsEnabled === undefined ||
+    isPTCRequested ||
+    isCodeExecutionToolRequested ||
+    isSkillToolRequested ||
+    isSandboxFileToolRequested
+  ) {
     enabledCapabilities = await resolveAgentCapabilities(req, appConfig, agent?.id);
   }
   if (actionsEnabled === undefined) {
@@ -1707,17 +1773,21 @@ async function loadToolsForExecution({
     enabledCapabilities?.has(AgentCapabilities.execute_code) === true &&
     agent?.tools?.includes(Tools.execute_code) === true;
 
-  /**
-   * Opt bash_tool into the hedged stateful-session description. Gated on code
-   * execution being enabled AND the admin `stateful_code_sessions` capability
-   * AND the agent's own builder opt-in; off by default. Sets prompt text only
-   * (the wire hint is set at run config). PTC keeps its stateless prompt in
-   * v1. Older @librechat/agents ignore the param.
-   */
+  /** Resolve the trusted endpoint/profile from the actually executing agent.
+   * This stays per-agent across handoffs and subagents; no graph-global stateful
+   * flag or model-supplied value is consulted. */
   const statefulCodeSessions =
     codeExecutionEnabled &&
     enabledCapabilities?.has(AgentCapabilities.stateful_code_sessions) === true &&
     agent?.stateful_code_sessions === true;
+  const codeExecutionContext = resolveCodeExecutionContext({
+    statefulSessions: statefulCodeSessions,
+    environment: agent?.stateful_code_environment,
+    userId: req.user.id,
+    agentId: agent?.id,
+    conversationId: conversationId ?? runtimeRequestBody?.conversationId,
+  });
+  configurable.codeExecutionContext = codeExecutionContext;
 
   const isPTC =
     isPTCRequested &&
@@ -1747,6 +1817,9 @@ async function loadToolsForExecution({
       for (const name of ptcToolNames) {
         const ptcTool = createBashProgrammaticToolCallingTool({
           authHeaders: () => getCodeApiAuthHeaders(req),
+          baseUrl: codeExecutionContext.baseUrl,
+          executionProfile: codeExecutionContext.executionProfile,
+          runtimeSessionHint: codeExecutionContext.runtimeSessionHint,
         });
         ptcTool.name = name;
         allLoadedTools.push(ptcTool);
@@ -1770,7 +1843,7 @@ async function loadToolsForExecution({
     try {
       const bashTool = createBashExecutionTool({
         authHeaders: () => getCodeApiAuthHeaders(req),
-        statefulSessions: statefulCodeSessions,
+        ...codeExecutionContext,
       });
       allLoadedTools.push(bashTool);
     } catch (error) {
@@ -1842,6 +1915,7 @@ async function loadToolsForExecution({
       options: {
         req,
         res,
+        requestBody: runtimeRequestBody,
         agentResourceType,
         jobCreatedAt,
         tool_resources,

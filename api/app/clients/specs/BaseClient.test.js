@@ -691,6 +691,21 @@ describe('BaseClient', () => {
       );
     });
 
+    it('honors response and user message IDs preallocated before initialization', async () => {
+      TestClient = initializeFakeClient(apiKey, options, messageHistory);
+
+      const result = await TestClient.handleStartMethods('request-scoped MCP', {
+        conversationId,
+        parentMessageId: '3',
+        preallocatedUserMessageId: 'preallocated-user',
+        preallocatedResponseMessageId: 'preallocated-response',
+      });
+
+      expect(result.userMessage.messageId).toBe('preallocated-user');
+      expect(result.responseMessageId).toBe('preallocated-response');
+      expect(TestClient.responseMessageId).toBe('preallocated-response');
+    });
+
     it('applies edited reasoning content from its typed payload before regeneration', async () => {
       const responseMessageId = 'response-with-reasoning';
       const newHistory = [
@@ -701,7 +716,17 @@ describe('BaseClient', () => {
           messageId: responseMessageId,
           parentMessageId: '3',
           content: [
-            { type: ContentTypes.THINK, think: 'Original reasoning', phase: 'analysis' },
+            {
+              type: ContentTypes.THINK,
+              think: 'Original reasoning',
+              phase: 'analysis',
+              reasoning_label: 'Inspecting the original path',
+              reasoning_label_step_id: 'old-step',
+              reasoning_label_attempts: 2,
+              reasoning_label_submitted_chars: 18,
+              reasoning_label_revision: 2,
+              reasoning_label_status: 'complete',
+            },
             { type: ContentTypes.TEXT, text: 'Original response' },
           ],
         },
@@ -877,6 +902,40 @@ describe('BaseClient', () => {
       }
     });
 
+    test('persists the Langfuse sampling decision for agent clients using a provider endpoint', async () => {
+      const previousSampleRate = process.env.LANGFUSE_SAMPLE_RATE;
+      const previousClientName = TestClient.clientName;
+      const previousEndpoint = TestClient.options.endpoint;
+      process.env.LANGFUSE_SAMPLE_RATE = '0';
+      TestClient.clientName = 'agents';
+      TestClient.options.endpoint = 'bedrock';
+      const saveSpy = jest.spyOn(TestClient, 'saveMessageToDatabase');
+
+      try {
+        const response = await TestClient.sendMessage('Hello, world!', { user: {} });
+
+        expect(response.langfuseSampled).toBe(false);
+        expect(response.langfuseDestinationIds).toEqual([]);
+        expect(saveSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            endpoint: 'bedrock',
+            langfuseSampled: false,
+            langfuseDestinationIds: [],
+          }),
+          expect.any(Object),
+          expect.any(Object),
+        );
+      } finally {
+        if (previousSampleRate == null) {
+          delete process.env.LANGFUSE_SAMPLE_RATE;
+        } else {
+          process.env.LANGFUSE_SAMPLE_RATE = previousSampleRate;
+        }
+        TestClient.clientName = previousClientName;
+        TestClient.options.endpoint = previousEndpoint;
+      }
+    });
+
     test('persists no Langfuse destination when a sampled trace has no configured export', async () => {
       const envKeys = [
         'LANGFUSE_PUBLIC_KEY',
@@ -1011,6 +1070,15 @@ describe('BaseClient', () => {
         anotherExistingField: 'anotherValue',
         temperature: 0.7,
         modelLabel: 'GPT-3.5',
+        subagentThread: {
+          rootConversationId: 'root-conversation',
+          parentConversationId: 'parent-conversation',
+          parentMessageId: 'parent-message',
+          parentToolCallId: 'parent-tool-call',
+          subagentType: 'researcher',
+          subagentKind: 'agent',
+          depth: 1,
+        },
       };
 
       getConvo.mockResolvedValue(existingConvo);
@@ -1045,6 +1113,7 @@ describe('BaseClient', () => {
 
       // Only check that someExistingField is in unsetFields
       expect(saveOptions.unsetFields).toHaveProperty('someExistingField', 1);
+      expect(saveOptions.unsetFields).not.toHaveProperty('subagentThread');
 
       // Mock saveConvo to return the expected fields
       saveConvo.mockImplementation((req, fields) => {
@@ -1910,6 +1979,71 @@ describe('BaseClient', () => {
   });
 
   describe('mergeEditedContent phase boundaries', () => {
+    test('carries the new reasoning label when adjacent THINK parts merge', () => {
+      const existing = [
+        {
+          type: ContentTypes.THINK,
+          think: 'Retained reasoning. ',
+          reasoning_label: 'Inspecting the old path',
+          reasoning_label_step_id: 'old-step',
+          reasoning_label_attempts: 1,
+          reasoning_label_submitted_chars: 18,
+          reasoning_label_revision: 1,
+          reasoning_label_status: 'complete',
+        },
+      ];
+      const completion = [
+        {
+          type: ContentTypes.THINK,
+          think: 'Continued reasoning.',
+          reasoning_label: 'Tracing the regenerated path',
+          reasoning_label_step_id: 'new-step',
+          reasoning_label_attempts: 3,
+          reasoning_label_submitted_chars: 20,
+          reasoning_label_revision: 2,
+          reasoning_label_status: 'streaming',
+        },
+      ];
+
+      expect(TestClient.mergeEditedContent(existing, completion, ContentTypes.THINK)).toEqual([
+        {
+          ...completion[0],
+          think: 'Retained reasoning. Continued reasoning.',
+        },
+      ]);
+    });
+
+    test('clears a retained reasoning label when the merged THINK has no label', () => {
+      const existing = [
+        {
+          type: ContentTypes.THINK,
+          think: 'Retained reasoning. ',
+          agentId: 'agent-1',
+          reasoning_label: 'Inspecting the old path',
+          reasoning_label_step_id: 'old-step',
+          reasoning_label_attempts: 3,
+          reasoning_label_submitted_chars: 18,
+          reasoning_label_revision: 2,
+          reasoning_label_status: 'complete',
+        },
+      ];
+      const completion = [
+        {
+          type: ContentTypes.THINK,
+          think: 'Continued without a generated title.',
+          agentId: 'agent-1',
+        },
+      ];
+
+      expect(TestClient.mergeEditedContent(existing, completion, ContentTypes.THINK)).toEqual([
+        {
+          type: ContentTypes.THINK,
+          think: 'Retained reasoning. Continued without a generated title.',
+          agentId: 'agent-1',
+        },
+      ]);
+    });
+
     test('does not merge commentary into a final answer', () => {
       const existing = [
         { type: ContentTypes.TEXT, text: 'Checked the deployment. ', phase: 'commentary' },
