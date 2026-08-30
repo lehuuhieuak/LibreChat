@@ -1,4 +1,5 @@
 const { Constants, ContentTypes } = require('librechat-data-provider');
+const BaseClientClass = require('../BaseClient');
 const { ContentFilterError } = require('@librechat/api');
 const { FakeClient, initializeFakeClient } = require('./FakeClient');
 
@@ -98,6 +99,26 @@ describe('BaseClient', () => {
       },
       summaryTokenCount: 5,
     });
+  });
+
+  test('persists only the host-authored external event display projection on the user turn', () => {
+    const projection = {
+      version: 1,
+      eventType: 'chess.turn.ready',
+      sourceType: 'speed-chess',
+      occurredAt: new Date('2026-08-21T12:00:00.000Z'),
+      expectedActionToolName: 'submit_move',
+    };
+    TestClient.options.req = { _agentEventTriggerProjection: projection };
+
+    expect(
+      TestClient.createUserMessage({
+        messageId: 'event:user',
+        parentMessageId: 'parent',
+        conversationId: 'event-thread',
+        text: 'Private event payload',
+      }),
+    ).toEqual(expect.objectContaining({ subagentTriggerProjection: projection }));
   });
 
   test('returns the input messages without instructions when addInstructions() is called with empty instructions', () => {
@@ -224,6 +245,39 @@ describe('BaseClient', () => {
     expect(result.messagesToRefine.length - 1).toEqual(expectedIndex);
     expect(result.remainingContextTokens).toBe(expectedRemainingContextTokens);
     expect(result.messagesToRefine).toEqual(expectedMessagesToRefine);
+  });
+
+  describe('loadHistory', () => {
+    const receiver = Object.assign(Object.create(BaseClientClass.prototype), {
+      user: 'user-1',
+      getMessageMapMethod: null,
+      shouldSummarize: false,
+      addPreviousAttachments: async (messages) => messages,
+    });
+    const loadHistory = (parentMessageId) => receiver.loadHistory('convo-1', parentMessageId);
+
+    beforeEach(() => {
+      getMessages.mockClear();
+    });
+
+    test('skips the database when the parent is the root sentinel: no message can match it', async () => {
+      const result = await loadHistory(Constants.NO_PARENT);
+
+      expect(result).toEqual([]);
+      expect(getMessages).not.toHaveBeenCalled();
+    });
+
+    test('still loads and walks the chain for a real parent', async () => {
+      getMessages.mockResolvedValueOnce([
+        { messageId: 'root', parentMessageId: Constants.NO_PARENT, text: 'a' },
+        { messageId: 'reply', parentMessageId: 'root', text: 'b' },
+      ]);
+
+      const result = await loadHistory('reply');
+
+      expect(getMessages).toHaveBeenCalledTimes(1);
+      expect(result.map((m) => m.messageId)).toEqual(['root', 'reply']);
+    });
   });
 
   describe('getMessagesForConversation', () => {
@@ -1724,6 +1778,7 @@ describe('BaseClient', () => {
         anotherExistingField: 'anotherValue',
         temperature: 0.7,
         modelLabel: 'GPT-3.5',
+        pinned: true,
         subagentThread: {
           rootConversationId: 'root-conversation',
           parentConversationId: 'parent-conversation',
@@ -1768,6 +1823,9 @@ describe('BaseClient', () => {
       // Only check that someExistingField is in unsetFields
       expect(saveOptions.unsetFields).toHaveProperty('someExistingField', 1);
       expect(saveOptions.unsetFields).not.toHaveProperty('subagentThread');
+      // Sidebar metadata is never part of endpointOptions, so sweeping it would
+      // unpin a chat every time it received a message.
+      expect(saveOptions.unsetFields).not.toHaveProperty('pinned');
 
       // Mock saveConvo to return the expected fields
       saveConvo.mockImplementation((req, fields) => {
@@ -1835,6 +1893,36 @@ describe('BaseClient', () => {
           conversationId: expect.any(String),
         }),
       );
+    });
+
+    test('saveMessageToDatabase appends the saved message id instead of rebuilding the array', async () => {
+      const savedId = new (require('mongoose').Types.ObjectId)();
+      saveMessage.mockResolvedValueOnce({ _id: savedId, messageId: 'saved-1' });
+      saveConvo.mockResolvedValueOnce({ conversationId });
+
+      await TestClient.saveMessageToDatabase(
+        { messageId: 'saved-1', conversationId, text: 'hi' },
+        TestClient.getSaveOptions(),
+      );
+
+      expect(saveConvo).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ appendMessageIds: [savedId] }),
+      );
+    });
+
+    test('saveMessageToDatabase rebuilds the array when the saved message has no _id', async () => {
+      saveMessage.mockResolvedValueOnce({ messageId: 'saved-2' });
+      saveConvo.mockResolvedValueOnce({ conversationId });
+
+      await TestClient.saveMessageToDatabase(
+        { messageId: 'saved-2', conversationId, text: 'hi' },
+        TestClient.getSaveOptions(),
+      );
+
+      const metadata = saveConvo.mock.calls[saveConvo.mock.calls.length - 1][2];
+      expect(metadata).not.toHaveProperty('appendMessageIds');
     });
 
     test('saveMessageToDatabase returns early when this.options is null (client disposed)', async () => {

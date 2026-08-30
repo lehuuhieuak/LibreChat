@@ -4,11 +4,72 @@ import type {
   TPendingSteer,
   UserSubmittedMessageFieldPath,
 } from 'librechat-data-provider';
-import type { StandardGraph } from '@librechat/agents';
+import type { RunStep, StandardGraph } from '@librechat/agents';
+import type { AgentEventDetachedTerminalEvidence } from '~/agents/triggers/types';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
+
+/**
+ * Detached Event Actor execution guarantee advertised by a generation store.
+ *
+ * `process_local` keeps the lifecycle coherent while this process is alive.
+ * `distributed` additionally permits restart recovery and replica handoff.
+ * Absence means the store cannot host detached Event Actor actions.
+ */
+export type DetachedAgentEventActionStoreMode = 'process_local' | 'distributed';
+
+/**
+ * Rewrites string-enum members to their literal values, recursively. The SDK and
+ * data-provider declare nominally distinct enums (`ContentTypes`, `StepTypes`, ...)
+ * with identical string values; erasing that nominality is what lets the two run-step
+ * contracts be compared structurally.
+ */
+type WireShape<T> = T extends string
+  ? `${T}`
+  : T extends readonly (infer U)[]
+    ? WireShape<U>[]
+    : T extends object
+      ? { [K in keyof T]: WireShape<T[K]> }
+      : T;
+
+type StaticAssert<T extends true> = T;
+
+/**
+ * Compile-time proof that the SDK run step and the wire contract (`Agents.RunStep`)
+ * agree structurally once enum nominality is erased: any added, removed, retyped, or
+ * newly optional SDK field fails these assertions, so drift cannot silently enter
+ * resume state through `toWireRunSteps`.
+ *
+ * `summary.content` is the one deliberately unchecked field: the SDK reuses its full
+ * `MessageContentComplex` union there, while the wire contract narrows it to the plain
+ * text blocks summarization actually emits. That narrowing is the single semantic
+ * judgment this conversion vouches for.
+ */
+type _WireRunStepContractHolds = StaticAssert<
+  WireShape<Omit<RunStep, 'summary'>> extends WireShape<Omit<Agents.RunStep, 'summary'>>
+    ? true
+    : false
+>;
+
+type _WireSummaryContractHolds = StaticAssert<
+  WireShape<Omit<NonNullable<RunStep['summary']>, 'content'>> extends WireShape<
+    Omit<NonNullable<Agents.RunStep['summary']>, 'content'>
+  >
+    ? true
+    : false
+>;
+
+/**
+ * Run steps living on the SDK graph serialize to exactly the wire shape
+ * `Agents.RunStep` describes; the assertion is safe because
+ * `_WireRunStepContractHolds` above proves the contracts identical modulo the
+ * nominally-split enums, which share their string values at runtime.
+ */
+export function toWireRunSteps(steps: readonly RunStep[]): Agents.RunStep[] {
+  return steps as Agents.RunStep[];
+}
 
 /**
  * A pause owner has this long to durably persist the interrupted turn before
@@ -18,6 +79,11 @@ import type { MCPRuntimeRequestBody } from '~/mcp/types';
  */
 export const PAUSE_PERSISTENCE_TIMEOUT_MS = 30_000;
 export const PAUSE_PERSISTENCE_TIMEOUT_ERROR = 'Paused response persistence timed out';
+/** Maximum time a terminal provider owner may remain undrained before its
+ * process is treated as lost. Terminal host settlement retains the last
+ * durable evidence through this grace period, then releases the lane from a
+ * crashed owner instead of refreshing its fence forever. */
+export const PROVIDER_DRAIN_TIMEOUT_MS = 30_000;
 
 /**
  * Job status enum.
@@ -116,6 +182,24 @@ export interface SerializableJobData {
    * preempt shipped, which reads as incapable: the honest outcome.
    */
   preemptCapable?: boolean;
+  /**
+   * Transient owner assertion that this replica's drain merges
+   * `SteerQueueItem.quotes` into the injected turn. Never stored as-is:
+   * createJob and `ApprovalLifecycle.resolve` translate it into
+   * `steerQuotesExecutionId` bound to the asserting owner's execution.
+   */
+  steerQuotesCapable?: boolean;
+  /**
+   * The `providerExecutionId` of the owner that asserted quote capability.
+   * Valid only while it equals the LIVE `providerExecutionId`: a legacy
+   * replica winning a HITL resume rewrites the execution id but cannot know
+   * this field, so its stale assertion self-invalidates — which a bare
+   * boolean could not do (an old resume patch omits rather than clears it).
+   * The fenced enqueue evaluates the equality atomically and strips
+   * `item.quotes` on mismatch, keeping the persisted item and the
+   * `quotesAccepted` echo honest; the client re-stages dropped excerpts.
+   */
+  steerQuotesExecutionId?: string;
 
   /** Explicitly false until the provider-owning replica has installed its
    * generation-fenced abort subscription. Missing is conservative legacy
@@ -125,6 +209,10 @@ export interface SerializableJobData {
   /** Opaque identity of the currently executing provider segment. A HITL resume
    * replaces it so an earlier paused segment cannot acknowledge the new run. */
   providerExecutionId?: string;
+  /** Durable evidence that the current provider owner crossed its start CAS.
+   * Unlike `providerDrained`, this identity survives terminal drain so host
+   * compensation can distinguish a projected-but-never-started resume. */
+  providerExecutionStartedId?: string;
   /** False while the identified provider segment can still mutate user data;
    * true before provider startup and after the owner has fully unwound. */
   providerDrained?: boolean;
@@ -155,6 +243,14 @@ export interface SerializableJobData {
    * no action clears it immediately on its no-op success, so nothing accumulates.
    */
   terminalHostActionPending?: boolean;
+  /** Redis-only durable marker for a detached Event Actor completion hook.
+   * Capable stores expose it through `terminalHostActionPending` as well, but
+   * keep the persisted field distinct so legacy reconciliation cannot index or
+   * claim the completion through the ordinary terminal-action lane. */
+  detachedAgentEventTerminalHostActionPending?: boolean;
+  /** Logical terminal state hidden behind a versioned fail-closed shell while
+   * a detached Event Actor host action remains unacknowledged. */
+  detachedAgentEventTerminalStatus?: Extract<JobStatus, 'complete' | 'aborted' | 'error'>;
   /**
    * Last time a cleanup pass enumerated this pending host action for retry. Retention is
    * measured from this rather than `completedAt`, so evidence survives as long as some
@@ -204,6 +300,22 @@ export interface SerializableJobData {
    * resume request can't be trusted to re-send the flag.
    */
   isTemporary?: boolean;
+  agentEventDeliveryKey?: string;
+  /** Original actor invocation when an internal completion delivery owns this generation. */
+  agentEventInvocationKey?: string;
+  /** Original actor invocation generation retained across completion HITL resumes. */
+  agentEventInvocationGenerationCreatedAt?: number;
+  /** This generation must resume on a durable detached-action producer. */
+  agentEventDetachedActionProducerRequired?: boolean;
+  /** Durable retry payload captured before detached terminal evidence is written to Mongo. */
+  agentEventDetachedTerminalEvidence?: AgentEventDetachedTerminalEvidence;
+  /** Trusted actor binding copied from the authenticated delivery envelope. */
+  agentEventBindingId?: string;
+  agentEventExpectedAction?: import('~/agents/triggers/types').AgentTriggerExpectedAction;
+  /** Versioned pointer to the canonical signed Conversation suspension. */
+  agentEventSuspension?: import('~/agents/triggers/types').AgentEventSuspensionProjection;
+  /** Exact durable legacy-turn fence carried across a HITL pause/resume. */
+  agentEventLegacyTurnToken?: string;
 
   /**
    * Set when status is `requires_action`. Describes the human review the
@@ -321,6 +433,15 @@ export type JobMetadataPatch = Partial<
     | 'model'
     | 'agent_id'
     | 'isTemporary'
+    | 'agentEventDeliveryKey'
+    | 'agentEventInvocationKey'
+    | 'agentEventInvocationGenerationCreatedAt'
+    | 'agentEventDetachedActionProducerRequired'
+    | 'agentEventDetachedTerminalEvidence'
+    | 'agentEventBindingId'
+    | 'agentEventExpectedAction'
+    | 'agentEventSuspension'
+    | 'agentEventLegacyTurnToken'
     | 'scheduleId'
     | 'scheduledFor'
     | 'scheduleConfigRevision'
@@ -332,6 +453,8 @@ export type JobMetadataPatch = Partial<
     | 'discoveredTools'
     | 'activityPhaseSnapshot'
     | 'preemptCapable'
+    | 'steerQuotesCapable'
+    | 'steerQuotesExecutionId'
     | 'providerExecutionId'
     | 'providerDrained'
     | 'generationProtocolVersion'
@@ -376,6 +499,10 @@ export interface SteerQueueItem {
    *  drain re-fetches each file by id scoped to the run's user and encodes
    *  fresh, so nothing here is trusted beyond identifying the file. */
   files?: Partial<TFile>[];
+  /** Quoted excerpts steered with the message, normalized at admission
+   *  (`getReferencedQuotes`). Kept separate from `text` so the persisted
+   *  steer part stays clean; merged into the model-bound turn at injection. */
+  quotes?: string[];
   /** The steer asked to seal the live model stream at the next provider-safe
    *  boundary instead of waiting for a tool step. Durable so a parked,
    *  claimed, or replayed chip keeps its "interrupting" label. */
@@ -391,7 +518,16 @@ export interface SteerQueueItem {
  * the same instruction twice after drain, terminal cleanup, or replacement. */
 export interface SteerReceipt {
   clientSteerId: string;
+  /** Quote-INDEPENDENT content hash (text/files/preempt) — the one shape every
+   * replica version computes, so lost-ACK retries replay across a rolling
+   * deploy in both directions. */
   fingerprint: string;
+  /** Identity of the REQUESTED quotes (pre any owner-capability strip),
+   * recorded beside the fingerprint so quote-aware readers enforce quote
+   * identity without making the fingerprint unreadable to legacy admission.
+   * Absent on receipts written by pre-quotes replicas or for quote-less
+   * requests. */
+  requestedQuotesFingerprint?: string;
   userId: string;
   tenantId?: string;
   agentId?: string;
@@ -466,6 +602,17 @@ export const STEER_ENQUEUE_QUEUE_FULL = -2;
  * so idempotency evidence is never evicted inside its recovery window. */
 export const STEER_ENQUEUE_RECEIPT_FULL = -3;
 
+/** The store rejected a status CAS because its atomic deadline had elapsed. */
+export class JobStatusTransitionDeadlineError extends Error {
+  readonly notAfterMs: number;
+
+  constructor(notAfterMs: number) {
+    super('The status transition deadline elapsed before the transition could commit');
+    this.name = 'JobStatusTransitionDeadlineError';
+    this.notAfterMs = notAfterMs;
+  }
+}
+
 /**
  * Arguments for an atomic {@link IJobStore.transitionStatus} compare-and-set.
  */
@@ -490,6 +637,12 @@ export interface JobStatusTransition {
    * the same stream ID.
    */
   expectCreatedAt?: number;
+  /**
+   * Additional guard: reject the transition when the store's clock has reached
+   * this absolute deadline. The comparison is part of the same atomic operation
+   * as the status change, so queueing or storage latency cannot publish stale state.
+   */
+  notAfterMs?: number;
   /** Extend all current steer receipts in the SAME atomic step as this
    * transition. Used by running→requires_action so no enqueue can land between
    * a pre-pause TTL pass and the status CAS. */
@@ -705,6 +858,8 @@ export interface ResumeState {
  * store at runtime.
  */
 export interface IJobStore {
+  readonly detachedAgentEventActionStoreMode?: DetachedAgentEventActionStoreMode;
+
   initialize(): Promise<void>;
 
   createJob(
@@ -730,6 +885,11 @@ export interface IJobStore {
   ): Promise<IdempotencyClaimResult>;
   releaseIdempotencyKey(key: string): Promise<void>;
 
+  /** Read-only existence probe used to identify a confirmed retry before
+   * request-rate admission. Optional stores keep the conservative behavior
+   * where every request remains subject to the limiter. */
+  hasIdempotencyKey?(key: string): Promise<boolean>;
+
   deleteJob(streamId: string, expectedCreatedAt?: number): Promise<boolean>;
   hasJob(streamId: string): Promise<boolean>;
   getRunningJobs(): Promise<SerializableJobData[]>;
@@ -741,6 +901,11 @@ export interface IJobStore {
    * retry the host adapter after a restart / on another replica, even though the job is
    * no longer in the requires_action index. */
   getTerminalHostActionJobs?(): Promise<SerializableJobData[]>;
+  /** Enumerates detached Event Actor completion generations from a versioned
+   * retry lane known only to capable consumers. Redis keeps this lane separate
+   * from `getTerminalHostActionJobs` so a rolling-deployment replica that only
+   * understands the legacy job identity can never claim it. */
+  getDetachedAgentEventTerminalHostActionJobs?(): Promise<SerializableJobData[]>;
   /** Clears the pending-host-action marker once the adapter acknowledges success.
    * Identity-fenced on `expectedCreatedAt` so a replacement generation at the same
    * streamId is never cleared through its predecessor. */

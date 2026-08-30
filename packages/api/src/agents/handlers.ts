@@ -69,6 +69,7 @@ import {
 import { getSafeErrorMetadata, logAxiosError, runOutsideTracing, truncateMiddle } from '~/utils';
 import { resolveCallerCapabilityProjectionSnapshot } from './callerCapabilities';
 import { buildSkillPrimeMessage, SKILL_FILE_PREFIX } from './skills';
+import { createSkillContentDigest } from './compatibility';
 import { parseFrontmatter } from '../skills/import';
 import { cleanCodeToolOutput } from './cleanup';
 import { primeSkillFiles } from './skillFiles';
@@ -76,12 +77,66 @@ import { instrumentPtcToolMap } from './ptc';
 import { markSandboxReady } from './prewarm';
 
 export interface ToolEndCallbackData {
+  /** The executed call's arguments. The stream-consumer tool-end path cannot
+   * reconstruct these, so the execution handler — which owns both halves —
+   * must supply them for consumers that fence on the input (the event-actor
+   * action recorder validates its declared argument subset against this). */
+  input?: unknown;
+  /** True when this callback delivers the harvested completion of a
+   * previously dispatched background task on a poll turn. `output.name` then
+   * reports the ORIGINAL tool for artifact attribution while `input` carries
+   * the poll call's arguments — consumers that fence on execution identity
+   * (the event-actor action recorder) must ignore these deliveries, or a
+   * name-only expected action could be impersonated by work another turn
+   * dispatched. */
+  backgroundDelivery?: boolean;
+  /** True when the tool executed successfully but its returned content was
+   * withheld by post-execution output policy. `output.content` is blank and
+   * no artifact rides the callback — this delivery exists solely so
+   * execution-identity consumers (the event-actor action recorder) can prove
+   * the side effect occurred; a retry of an "actionless" turn would otherwise
+   * repeat an external action whose output was merely filtered. */
+  outputFiltered?: boolean;
   output: {
     name: string;
     tool_call_id: string;
     content: string | unknown;
     artifact?: unknown;
   };
+}
+
+export interface EventActorDetachedActionLifecycle {
+  reserve(input: {
+    toolName: string;
+    toolCallId: string;
+    turnId: string;
+    arguments: unknown;
+  }): Promise<
+    | { status: 'ignored' }
+    | { status: 'conflict'; error?: string }
+    | {
+        status: 'terminal';
+        taskId: string;
+        idempotencyKey: string;
+        outcome: 'succeeded' | 'failed' | 'cancelled';
+        result?: string;
+        error?: string;
+      }
+    | {
+        status: 'reserved' | 'replay';
+        taskId: string;
+        idempotencyKey: string;
+      }
+  >;
+  markRunning(input: { taskId: string; idempotencyKey: string }): Promise<boolean>;
+  settle(input: {
+    taskId: string;
+    idempotencyKey: string;
+    status: 'succeeded' | 'failed' | 'cancelled';
+    result?: unknown;
+    error?: string;
+  }): Promise<boolean>;
+  wake(input: { taskId: string; idempotencyKey: string }): Promise<void>;
 }
 
 export interface ToolEndCallbackMetadata {
@@ -113,6 +168,8 @@ export interface ToolExecuteOptions {
   subagentTasks?: SubagentTaskConfig;
   /** Callback to process tool artifacts (code output files, file citations, etc.) */
   toolEndCallback?: ToolEndCallback;
+  /** Durable internal-completion adapter, present only for an Event Actor invocation. */
+  eventActorDetachedAction?: EventActorDetachedActionLifecycle;
   /**
    * Persists a backgrounded code-execution result onto the dispatch turn once
    * the detached call settles: downloads/persists generated files, patches the
@@ -179,6 +236,16 @@ export interface ToolExecuteOptions {
      */
     disableModelInvocation?: boolean;
   } | null>;
+  /** Captures a successfully resolved model-invoked Skill for durable continuation context. */
+  onSkillResolved?: (
+    skill: {
+      id: string;
+      name: string;
+      version: number;
+      contentDigest: string;
+    },
+    context: { agentId?: string },
+  ) => void;
   /**
    * Loads a skill by name when the current user is the author. This is a
    * narrow recovery path for freshly-authored skills whose runtime catalog
@@ -3865,6 +3932,7 @@ async function handleSkillToolCall(
   tc: ToolCallRequest,
   mergedConfigurable: Record<string, unknown>,
   options: ToolExecuteOptions,
+  agentId?: string,
   req?: ServerRequest,
 ): Promise<ToolExecuteResult> {
   const {
@@ -4037,6 +4105,16 @@ async function handleSkillToolCall(
     }
   }
 
+  options.onSkillResolved?.(
+    {
+      id: skill._id.toString(),
+      name: skill.name,
+      version: skill.version,
+      contentDigest: createSkillContentDigest(skill.body),
+    },
+    { agentId },
+  );
+
   return {
     toolCallId: tc.id,
     content: contentText,
@@ -4190,6 +4268,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
   const {
     loadTools,
     toolEndCallback,
+    eventActorDetachedAction,
     persistBackgroundCodeResult,
     emitAttachment,
     emitPtcProgress,
@@ -4325,7 +4404,9 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
             const backgroundRunId = (metadata as Record<string, unknown>)?.run_id as
               | string
               | undefined;
-            const dispatchBackgroundToolCall = (tc: ToolCallRequest): ToolExecuteResult => {
+            const dispatchBackgroundToolCall = async (
+              tc: ToolCallRequest,
+            ): Promise<ToolExecuteResult> => {
               /** A tool that failed to load must error immediately (matching the
                *  foreground path) — a synthetic "started" handle would tell the
                *  model a side effect is in flight that never executed. */
@@ -4351,7 +4432,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
               if (filtered != null) {
                 return filtered;
               }
-              const created = backgroundTaskRegistry.create({
+              const registration = {
                 userId: backgroundUserId,
                 conversationId: backgroundConversationId,
                 toolCallId: tc.id,
@@ -4363,8 +4444,93 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                  *  starts a fresh task instead of colliding. */
                 agentId,
                 runId: `${backgroundRunId ?? ''}:${tc.turn ?? ''}`,
+              };
+              const capacityAdmission =
+                eventActorDetachedAction == null
+                  ? undefined
+                  : backgroundTaskRegistry.reserveCapacity(registration);
+              if (capacityAdmission != null && 'atCapacity' in capacityAdmission) {
+                return {
+                  toolCallId: tc.id,
+                  status: 'success' as const,
+                  content: buildBackgroundCapacityContent(tc.name),
+                };
+              }
+              const capacityPermit =
+                capacityAdmission != null && 'permit' in capacityAdmission
+                  ? capacityAdmission.permit
+                  : undefined;
+              let detachedReservation;
+              try {
+                detachedReservation = await eventActorDetachedAction?.reserve({
+                  toolName: tc.name,
+                  toolCallId: tc.id,
+                  turnId: registration.runId,
+                  arguments: normalizedArgs,
+                });
+              } catch (error) {
+                if (capacityPermit != null) {
+                  backgroundTaskRegistry.releaseCapacity(capacityPermit);
+                }
+                throw error;
+              }
+              if (detachedReservation?.status === 'conflict') {
+                if (capacityPermit != null) {
+                  backgroundTaskRegistry.releaseCapacity(capacityPermit);
+                }
+                return {
+                  toolCallId: tc.id,
+                  status: 'error' as const,
+                  content: '',
+                  errorMessage:
+                    detachedReservation.error ??
+                    'Detached Event Actor action conflicts with its durable launch authority',
+                };
+              }
+              if (detachedReservation?.status === 'terminal') {
+                if (capacityPermit != null) {
+                  backgroundTaskRegistry.releaseCapacity(capacityPermit);
+                }
+                if (detachedReservation.outcome === 'succeeded') {
+                  return {
+                    toolCallId: tc.id,
+                    status: 'success' as const,
+                    content: detachedReservation.result ?? '',
+                  };
+                }
+                return {
+                  toolCallId: tc.id,
+                  status: 'error' as const,
+                  content: '',
+                  errorMessage:
+                    detachedReservation.error ?? `Detached action ${detachedReservation.outcome}`,
+                };
+              }
+              if (detachedReservation?.status === 'replay') {
+                if (capacityPermit != null) {
+                  backgroundTaskRegistry.releaseCapacity(capacityPermit);
+                }
+                return {
+                  toolCallId: tc.id,
+                  status: 'success' as const,
+                  content: buildBackgroundHandleContent({
+                    id: detachedReservation.taskId,
+                    toolName: tc.name,
+                    status: 'running',
+                  }),
+                };
+              }
+              const created = backgroundTaskRegistry.create({
+                ...(detachedReservation?.status === 'reserved'
+                  ? { taskId: detachedReservation.taskId }
+                  : {}),
+                ...registration,
+                ...(capacityPermit == null ? {} : { capacityPermit }),
               });
               if ('atCapacity' in created) {
+                if (detachedReservation?.status === 'reserved') {
+                  throw new Error('Detached Event Actor lost its pre-admitted background capacity');
+                }
                 return {
                   toolCallId: tc.id,
                   status: 'success' as const,
@@ -4453,17 +4619,74 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                     }
                   })();
                 };
-                void (async () => {
-                  try {
-                    const result = (await tool.invoke(normalizedArgs, {
+                let invokePromise: Promise<{ content?: unknown; artifact?: unknown }>;
+                try {
+                  invokePromise = Promise.resolve(
+                    tool.invoke(normalizedArgs, {
                       /** Full invoke config (not just identity): a detached
                        *  code call still needs `session_id`/`_injected_files`/
                        *  `_runtime_session_hint` or it runs fileless on the
                        *  Code API's default runtime session. */
                       toolCall: buildToolCallConfig(tc, mergedConfigurable),
-                      configurable: mergedConfigurable,
+                      configurable: {
+                        ...mergedConfigurable,
+                        ...(detachedReservation?.status === 'reserved'
+                          ? {
+                              eventActorDetachedAction: {
+                                taskId: detachedReservation.taskId,
+                                idempotencyKey: detachedReservation.idempotencyKey,
+                              },
+                            }
+                          : {}),
+                      },
                       metadata,
-                    } as Record<string, unknown>)) as { content?: unknown; artifact?: unknown };
+                    } as Record<string, unknown>),
+                  ) as Promise<{ content?: unknown; artifact?: unknown }>;
+                } catch (error) {
+                  /** Structured tools are permitted to reject synchronously.
+                   * Preserve the durable reservation and route that rejection
+                   * through the same terminal-evidence path as an async one. */
+                  invokePromise = Promise.reject(error);
+                }
+                const persistDetachedTerminal = async (
+                  input:
+                    | { status: 'succeeded'; result: unknown }
+                    | { status: 'failed' | 'cancelled'; error: string },
+                ): Promise<boolean> => {
+                  if (
+                    detachedReservation?.status !== 'reserved' ||
+                    eventActorDetachedAction == null
+                  ) {
+                    return true;
+                  }
+                  return eventActorDetachedAction.settle({
+                    taskId: detachedReservation.taskId,
+                    idempotencyKey: detachedReservation.idempotencyKey,
+                    ...input,
+                  });
+                };
+                const wakeDetachedActor = async (): Promise<void> => {
+                  if (
+                    detachedReservation?.status !== 'reserved' ||
+                    eventActorDetachedAction == null
+                  ) {
+                    return;
+                  }
+                  try {
+                    await eventActorDetachedAction.wake({
+                      taskId: detachedReservation.taskId,
+                      idempotencyKey: detachedReservation.idempotencyKey,
+                    });
+                  } catch (wakeError) {
+                    logger.warn(
+                      `[event-actor] Failed to wake detached action ${detachedReservation.taskId}`,
+                      wakeError,
+                    );
+                  }
+                };
+                void (async () => {
+                  try {
+                    const result = await invokePromise;
                     if (isCodeCall) {
                       markCodeSandboxWarm();
                     }
@@ -4481,6 +4704,14 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       const errorOutput = isCodeCall
                         ? toCodeToolFailure(tc.name, policyError)
                         : policyError;
+                      if (
+                        !(await persistDetachedTerminal({
+                          status: 'succeeded',
+                          result: errorOutput,
+                        }))
+                      ) {
+                        return;
+                      }
                       backgroundTaskRegistry.fail(
                         backgroundUserId,
                         backgroundConversationId,
@@ -4489,6 +4720,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                         { harvestStarted: harvestEnabled },
                       );
                       harvestCodeResult({ output: errorOutput });
+                      await wakeDetachedActor();
                       return;
                     }
                     /** Hold any artifact (images, files, UI resources,
@@ -4498,6 +4730,14 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                      *  artifactPromises are already awaited and the stream is
                      *  closed, so that push would be silently dropped. The poll
                      *  turn delivers it live in `check_background_task`. */
+                    if (
+                      !(await persistDetachedTerminal({
+                        status: 'succeeded',
+                        result: content,
+                      }))
+                    ) {
+                      return;
+                    }
                     backgroundTaskRegistry.complete(
                       backgroundUserId,
                       backgroundConversationId,
@@ -4508,6 +4748,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       output: typeof content === 'string' ? content : undefined,
                       artifact: result.artifact,
                     });
+                    await wakeDetachedActor();
                   } catch (toolError) {
                     const policyError =
                       toolError instanceof ContentFilterError
@@ -4527,6 +4768,20 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       isCodeCall && (policyError != null || filteredError != null)
                         ? toCodeToolFailure(tc.name, neutralizedError)
                         : neutralizedError;
+                    const detachedTerminalStatus =
+                      toolError instanceof Error &&
+                      (toolError.name === 'AbortError' ||
+                        (toolError as Error & { code?: string }).code === 'ABORT_ERR')
+                        ? 'cancelled'
+                        : 'failed';
+                    if (
+                      !(await persistDetachedTerminal({
+                        status: detachedTerminalStatus,
+                        error: deliveredError,
+                      }))
+                    ) {
+                      return;
+                    }
                     backgroundTaskRegistry.fail(
                       backgroundUserId,
                       backgroundConversationId,
@@ -4538,8 +4793,19 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       { harvestStarted: harvestEnabled },
                     );
                     harvestCodeResult({ output: deliveredError });
+                    await wakeDetachedActor();
                   }
                 })();
+                if (
+                  detachedReservation?.status === 'reserved' &&
+                  eventActorDetachedAction != null &&
+                  !(await eventActorDetachedAction.markRunning({
+                    taskId: detachedReservation.taskId,
+                    idempotencyKey: detachedReservation.idempotencyKey,
+                  }))
+                ) {
+                  throw new Error('Detached Event Actor launch acknowledgement is stale');
+                }
               }
               return {
                 toolCallId: tc.id,
@@ -4641,6 +4907,8 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       try {
                         await toolEndCallback(
                           {
+                            input: tc.args,
+                            backgroundDelivery: true,
                             output: {
                               name: pending.toolName,
                               tool_call_id: tc.id,
@@ -4792,7 +5060,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                     persistBackgroundCodeResult == null
                   )
                 ) {
-                  return reportResult(dispatchBackgroundToolCall(tc));
+                  return reportResult(await dispatchBackgroundToolCall(tc));
                 }
 
                 const execute = async (
@@ -4824,6 +5092,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                           tc,
                           mergedConfigurable,
                           options,
+                          agentId,
                           req,
                         );
                       } else if (tc.name === Constants.READ_FILE) {
@@ -4893,6 +5162,30 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       errorMessage: handlerResult.errorMessage,
                     });
                     if (filteredOutput != null) {
+                      /** The side effect already happened; only the returned
+                       * content is being withheld. Emit execution identity so
+                       * an applied action is never reclassified as actionless
+                       * and re-executed — the blocked output stays blank. */
+                      if (toolEndCallback && handlerResult.errorMessage == null) {
+                        try {
+                          await toolEndCallback(
+                            {
+                              input: tc.args,
+                              outputFiltered: true,
+                              output: { name: tc.name, tool_call_id: tc.id, content: '' },
+                            },
+                            {
+                              ...(metadata ?? {}),
+                              executingAgentId: agentId,
+                            } as ToolEndCallbackMetadata,
+                          );
+                        } catch (evidenceError) {
+                          logger.warn(
+                            `[ON_TOOL_EXECUTE] Filtered-output evidence delivery failed for ${tc.name}`,
+                            evidenceError,
+                          );
+                        }
+                      }
                       return filteredOutput;
                     }
 
@@ -4900,6 +5193,7 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       try {
                         await toolEndCallback(
                           {
+                            input: tc.args,
                             output: {
                               name: tc.name,
                               tool_call_id: tc.id,
@@ -5146,12 +5440,37 @@ export function createToolExecuteHandler(options: ToolExecuteOptions): EventHand
                       },
                     );
                     if (filteredOutput != null) {
+                      /** The side effect already happened; only the returned
+                       * content is being withheld. Emit execution identity so
+                       * an applied action is never reclassified as actionless
+                       * and re-executed — the blocked output stays blank. */
+                      if (toolEndCallback) {
+                        try {
+                          await toolEndCallback(
+                            {
+                              input: tc.args,
+                              outputFiltered: true,
+                              output: { name: tc.name, tool_call_id: tc.id, content: '' },
+                            },
+                            {
+                              ...(metadata ?? {}),
+                              executingAgentId: agentId,
+                            } as ToolEndCallbackMetadata,
+                          );
+                        } catch (evidenceError) {
+                          logger.warn(
+                            `[ON_TOOL_EXECUTE] Filtered-output evidence delivery failed for ${tc.name}`,
+                            evidenceError,
+                          );
+                        }
+                      }
                       return filteredOutput;
                     }
 
                     if (toolEndCallback) {
                       await toolEndCallback(
                         {
+                          input: tc.args,
                           output: {
                             name: tc.name,
                             tool_call_id: tc.id,

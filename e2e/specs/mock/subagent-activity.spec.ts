@@ -107,12 +107,13 @@ test.describe('detached subagent activity', () => {
       const activityResponse = await activityResponsePromise;
       await expect(panel).toBeVisible();
       await expect(panel.getByText('Running', { exact: true })).toBeVisible();
-      await expect(panel.getByText('Writing', { exact: true })).toBeVisible();
       await expect(panel).toContainText('child-1-phase-10');
       await expect.poll(() => activityRequests.length).toBe(1);
 
-      await expect(panel.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 });
-      await expect(panel).toContainText(`E2E detached child 1 complete ${label}`);
+      await expect(panel).toContainText(`E2E detached child 1 complete ${label}`, {
+        timeout: 30_000,
+      });
+      await expect(panel.getByText('Completed', { exact: true })).toHaveCount(0);
       await expect.poll(() => finishedActivityRequests.length).toBe(1);
       const activityStreamBody = await activityResponse.text();
       expect(activityStreamBody).toContain('"event":"on_subagent_update"');
@@ -123,8 +124,10 @@ test.describe('detached subagent activity', () => {
       await panel.getByRole('button', { name: 'Close' }).click();
       await expect(panel).not.toBeVisible();
       await cards.nth(1).click();
-      await expect(panel.getByText('Completed', { exact: true })).toBeVisible({ timeout: 30_000 });
-      await expect(panel).toContainText(`E2E detached child 2 complete ${label}`);
+      await expect(panel).toContainText(`E2E detached child 2 complete ${label}`, {
+        timeout: 30_000,
+      });
+      await expect(panel.getByText('Completed', { exact: true })).toHaveCount(0);
 
       await panel.getByRole('button', { name: 'Close' }).click();
       await page.reload();
@@ -134,8 +137,8 @@ test.describe('detached subagent activity', () => {
       );
       await expect(restoredCards).toHaveCount(2);
       await restoredCards.first().click();
-      await expect(panel.getByText('Completed', { exact: true })).toBeVisible();
       await expect(panel).toContainText(`E2E detached child 1 complete ${label}`);
+      await expect(panel.getByText('Completed', { exact: true })).toHaveCount(0);
 
       await panel.getByRole('button', { name: 'Close' }).click();
       await page.getByRole('button', { name: 'Chat History' }).click();

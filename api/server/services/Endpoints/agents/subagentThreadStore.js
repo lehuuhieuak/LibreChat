@@ -1,7 +1,6 @@
 const {
   cacheConfig,
   ioredisClient,
-  isEnabled,
   registerShutdownTask,
   duplicateIoRedisClient,
   createSubagentThreadTaskStore,
@@ -17,7 +16,6 @@ const { enqueueAgentTrigger } = require('../../Agents/triggers');
 const GENERATION_DRAIN_TIMEOUT_MS = 45_000;
 const GENERATION_DRAIN_POLL_MS = 100;
 const completionWakeupHandler = createSubagentCompletionWakeupHandler(enqueueAgentTrigger);
-const completionWakeupsEnabled = () => isEnabled(process.env.ENABLE_SUBAGENT_COMPLETION_WAKEUPS);
 
 async function cancelUnroutedGeneration({ userId, tenantId, taskId }) {
   let job = await GenerationJobManager.getJob(taskId);
@@ -62,8 +60,10 @@ const subagentThreadTaskStore = createSubagentThreadTaskStore(
     deleteConvos: db.deleteConvos,
     deleteMessages: db.deleteMessages,
     getConvo: db.getConvo,
+    getSubagentTaskControlReplay: db.getSubagentTaskControlReplay,
     getMessages: db.getMessages,
     listActiveSubagentThreadLeases: db.listActiveSubagentThreadLeases,
+    recordSubagentTaskControlReceipt: db.recordSubagentTaskControlReceipt,
     releaseSubagentThreadLease: db.releaseSubagentThreadLease,
     reserveSubagentThread: db.reserveSubagentThread,
     renewSubagentThreadLease: db.renewSubagentThreadLease,
@@ -76,12 +76,7 @@ const subagentThreadTaskStore = createSubagentThreadTaskStore(
     renewOwnerAdmission: db.renewSubagentAdmission,
     releaseOwnerAdmission: db.releaseSubagentAdmission,
     cancelUnroutedTask: cancelUnroutedGeneration,
-    onTaskPrepared: (registration) => {
-      if (!completionWakeupsEnabled()) {
-        return;
-      }
-      return completionWakeupHandler(registration);
-    },
+    onTaskPrepared: completionWakeupHandler,
   },
 );
 
@@ -92,6 +87,20 @@ registerShutdownTask(
 );
 
 let taskRoutingConfigured = false;
+let disconnectTaskRouting = () => {};
+
+/** Store quiescence is required even without Redis. Optional transport cleanup
+ * is attached after configuration, but local child cancellation and the final
+ * durable receipt flush always participate in graceful shutdown. */
+registerShutdownTask(
+  'subagent task store',
+  async () => {
+    await subagentThreadTaskStore.destroyTaskControlTransport();
+    subagentThreadTaskStore.destroyActivityStream();
+    disconnectTaskRouting();
+  },
+  { priority: 90 },
+);
 
 /** Starts the optional Redis owner directory before HTTP admission opens. */
 async function configureSubagentTaskRouting() {
@@ -125,22 +134,12 @@ async function configureSubagentTaskRouting() {
     throw error;
   }
   taskRoutingConfigured = true;
-  registerShutdownTask(
-    'subagent task control transport',
-    async () => {
-      await subagentThreadTaskStore.destroyTaskControlTransport();
-      subagentThreadTaskStore.destroyActivityStream();
-      publisher.disconnect();
-      activitySubscriber.disconnect();
-      activityPublisher.disconnect();
-    },
-    { priority: 90 },
-  );
+  disconnectTaskRouting = () => {
+    publisher.disconnect();
+    activitySubscriber.disconnect();
+    activityPublisher.disconnect();
+  };
 }
 
 module.exports = subagentThreadTaskStore;
-Object.defineProperty(module.exports, 'completionWakeupsEnabled', {
-  enumerable: true,
-  get: completionWakeupsEnabled,
-});
 module.exports.configureSubagentTaskRouting = configureSubagentTaskRouting;

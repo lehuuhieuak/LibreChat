@@ -30,6 +30,8 @@ export interface SubagentThreadWriteTarget {
   userId: string;
   conversationId: string;
   tenantId?: string;
+  /** Conversation already read earlier in the request (`null` = looked up, absent). */
+  conversation?: IConversation | null;
 }
 
 interface SubagentThreadWriteResolution {
@@ -44,10 +46,20 @@ interface ResolvedConversationRequest extends Request {
     isTemporary?: boolean;
     expiredAt?: Date;
   };
+  _agentEventBindingId?: string;
   _agentEventBindingParentConversationId?: string;
   _agentEventBindingParentAgentId?: string;
   _agentEventBindingTenantId?: string;
 }
+
+/**
+ * Brands the lineage-only conversation `isBoundEventContinuation` synthesizes: it stands in
+ * for binding checks but carries none of the stored document's optional fields, so readers
+ * of `req.resolvedConversation` must not treat its absent fields as authoritative.
+ */
+export const PARTIAL_RESOLVED_CONVERSATION: unique symbol = Symbol.for(
+  'librechat.resolvedConversation.partial',
+);
 
 function applyEventBindingContext(
   request: ResolvedConversationRequest,
@@ -58,6 +70,7 @@ function applyEventBindingContext(
     ...(conversation.isTemporary == null ? {} : { isTemporary: conversation.isTemporary }),
     ...(conversation.expiredAt == null ? {} : { expiredAt: conversation.expiredAt }),
   };
+  request._agentEventBindingId = conversation.agentEventBinding?.bindingId;
   request._agentEventBindingParentConversationId =
     conversation.subagentThread?.parentConversationId;
   request._agentEventBindingParentAgentId = conversation.subagentThread?.parentAgentId;
@@ -100,6 +113,7 @@ async function isBoundEventContinuation(
     return null;
   }
   return {
+    [PARTIAL_RESOLVED_CONVERSATION]: true,
     conversationId: binding.conversationId,
     agent_id: binding.agentId,
     ...(binding.tenantId == null ? {} : { tenantId: binding.tenantId }),
@@ -112,18 +126,23 @@ async function isBoundEventContinuation(
 
 async function resolveSubagentThreadWrite(
   { getConvo, store }: SubagentThreadWriteGuardDeps,
-  { userId, conversationId, tenantId }: SubagentThreadWriteTarget,
+  target: SubagentThreadWriteTarget,
 ): Promise<SubagentThreadWriteResolution> {
+  const { userId, conversationId, tenantId } = target;
+  const readConversation = (): Promise<IConversation | null> =>
+    target.conversation !== undefined
+      ? Promise.resolve(target.conversation)
+      : getConvo(userId, conversationId);
   /** New child IDs are returned synchronously by the SDK before Mongo creation can
    * finish. Their reserved UUID namespace closes that brief window on every replica. */
   if (isReservedSubagentThreadId(conversationId)) {
-    const conversation = await getConvo(userId, conversationId);
+    const conversation = await readConversation();
     return { blocked: true, conversation };
   }
   if (store.isThreadActiveForOwner(userId, conversationId, tenantId)) {
     return { blocked: true };
   }
-  const conversation = await getConvo(userId, conversationId);
+  const conversation = await readConversation();
   return { blocked: conversation?.subagentThread != null, conversation };
 }
 
@@ -159,10 +178,14 @@ export function createSubagentThreadTurnGuard(deps: SubagentThreadWriteGuardDeps
       typeof user?.tenantId === 'string' && user.tenantId !== '' ? user.tenantId : undefined;
 
     try {
+      const resolvedRequest = request as ResolvedConversationRequest;
       const resolved = await resolveSubagentThreadWrite(deps, {
         userId,
         conversationId: candidateConversationId,
         ...(tenantId == null ? {} : { tenantId }),
+        ...(Object.prototype.hasOwnProperty.call(request, 'resolvedConversation')
+          ? { conversation: resolvedRequest.resolvedConversation }
+          : {}),
       });
       if (resolved.conversation !== undefined) {
         (request as ResolvedConversationRequest).resolvedConversation = resolved.conversation;
@@ -171,7 +194,6 @@ export function createSubagentThreadTurnGuard(deps: SubagentThreadWriteGuardDeps
         next();
         return;
       }
-      const resolvedRequest = request as ResolvedConversationRequest;
       const resolvedConversation = resolved.conversation;
       const lineage = resolvedConversation?.subagentThread;
       const humanResume = deps.isHumanResumeAllowed;

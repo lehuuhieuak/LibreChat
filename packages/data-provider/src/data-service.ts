@@ -1002,12 +1002,29 @@ export function getMessagesByConvoId(conversationId: string): Promise<s.TMessage
   return request.get(endpoints.messages({ conversationId }));
 }
 
+export function getMessageById(conversationId: string, messageId: string): Promise<s.TMessage[]> {
+  return request.get(endpoints.messages({ conversationId, messageId }));
+}
+
+export function getParentSubagents(parentConversationId: string): Promise<t.ParentSubagentIndex> {
+  return request.get(endpoints.parentSubagents(parentConversationId));
+}
+
 export function getSubagentThread(
   parentConversationId: string,
   threadId: string,
   taskId?: string,
+  cursor?: string,
 ): Promise<t.SubagentThreadView> {
-  return request.get(endpoints.subagentThread(parentConversationId, threadId, taskId));
+  return request.get(endpoints.subagentThread(parentConversationId, threadId, taskId, cursor));
+}
+
+export function controlSubagentTask(
+  parentConversationId: string,
+  threadId: string,
+  body: t.SubagentControlRequest,
+): Promise<t.SubagentControlResponse> {
+  return request.post(endpoints.subagentControl(parentConversationId, threadId), body);
 }
 
 export function getPrompt(id: string): Promise<{ prompt: t.TPrompt }> {

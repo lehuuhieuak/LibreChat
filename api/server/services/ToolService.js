@@ -1,4 +1,4 @@
-const { logger, redactMessage } = require('@librechat/data-schemas');
+const { logger, redactMessage, getTenantId } = require('@librechat/data-schemas');
 const { tool: toolFn, DynamicStructuredTool } = require('@librechat/agents/langchain/tools');
 const {
   sleep,
@@ -11,6 +11,7 @@ const {
   sendEvent,
   getToolkitKey,
   getUserMCPAuthMap,
+  createAuthIdentityContext,
   loadToolDefinitions,
   GenerationJobManager,
   isActionDomainAllowed,
@@ -35,6 +36,7 @@ const {
   getSafeErrorMetadata,
   isContentFilterError,
   isFileAuthoringToolDefinition,
+  normalizeActionToolName,
   ASK_USER_QUESTION_TOOL_NAME,
   splitMCPToolKey,
   buildServerNameAliases,
@@ -44,6 +46,7 @@ const {
   isFatalAgentInitializationError,
   resolveCodeExecutionContext,
   resolveCallerCapabilityProjectionSnapshot,
+  getTransactionsConfig,
 } = require('@librechat/api');
 const {
   Time,
@@ -53,6 +56,7 @@ const {
   ErrorTypes,
   ContentTypes,
   imageGenTools,
+  AuthTypeEnum,
   EModelEndpoint,
   EToolResources,
   isActionTool,
@@ -92,6 +96,7 @@ const {
   getAccessibleMcpServerNames,
   resolveCollisionAuditNames,
 } = require('~/server/services/MCP');
+const { createOpenIDSessionTokenProvider } = require('~/server/services/OpenIDSessionRefresh');
 const { getMCPRequestContext } = require('~/server/services/MCPRequestContext');
 const { recordUsage } = require('~/server/services/Threads');
 const { loadTools } = require('~/app/clients/tools/util');
@@ -203,32 +208,6 @@ const prepareActionSnapshotForTools = async ({ agentId, toolNames, filters, decr
 };
 
 /**
- * Collapse every `actionDomainSeparator` sequence in the encoded-domain
- * suffix of a fully-qualified action tool name to an underscore. Agents
- * can store tool names in the raw `domainParser(..., true)` output,
- * which for short hostnames is a `---`-separated string (e.g.
- * `medium---com`). The lookup maps below are always keyed with the
- * `_`-collapsed domain, so every read must normalize that suffix or
- * short-hostname tools silently fail to resolve.
- *
- * The operationId portion (everything before the last `actionDelimiter`)
- * is deliberately left untouched: `openapiToFunction` preserves hyphens
- * in generated operationIds, so two specs can legitimately produce
- * operationIds that differ only in hyphens-vs-underscores (e.g.
- * `get_foo---bar` vs `get_foo_bar`). Collapsing the operationId would
- * merge those into a single map slot and silently drop one tool.
- */
-const normalizeActionToolName = (toolName) => {
-  const delimiterIndex = toolName.lastIndexOf(actionDelimiter);
-  if (delimiterIndex === -1) {
-    return toolName;
-  }
-  const prefixEnd = delimiterIndex + actionDelimiter.length;
-  const encodedDomain = toolName.slice(prefixEnd);
-  return toolName.slice(0, prefixEnd) + encodedDomain.replace(domainSeparatorRegex, '_');
-};
-
-/**
  * Populate a `toolToAction` map with one slot per fully-qualified tool
  * name (`<operationId><actionDelimiter><encoded-domain>`). Both the new
  * and the legacy encodings of the domain are registered for every
@@ -320,6 +299,7 @@ const processVisionRequest = async (client, currentAction) => {
       model: client.req.body.model,
       conversationId: (client.responseMessage ?? client.finalMessage).conversationId,
       ...completion.usage,
+      transactions: getTransactionsConfig(client.req.config),
     });
   }
   const output = completion?.choices?.[0]?.message?.content ?? 'No image details found.';
@@ -943,6 +923,23 @@ async function loadToolDefinitionsWrapper({
   /** @type {Record<string, import('@librechat/api').LCAvailableTools>} */
   const mcpAvailableTools = {};
   const requestScopedConnections = getMCPRequestContext(req, res);
+  /**
+   * Build the OBO upstream-token closure once at this request boundary and pass
+   * the function into MCP handling, so `reinitMCPServer` never receives the raw
+   * Express request. `res` is forwarded so a rotated refresh token can be
+   * mirrored to the `refreshToken` cookie when the response is still writable.
+   */
+  const oboIdentityContext = createAuthIdentityContext({
+    user: req.user,
+    tenantId: getTenantId(),
+  });
+  const upstreamTokenProvider = createOpenIDSessionTokenProvider({
+    req,
+    res,
+    user: req.user,
+    identityContext: oboIdentityContext,
+    tokenPreference: 'access_token',
+  });
   const rememberMCPAvailableTools = (serverName, availableTools) => {
     if (!availableTools || Object.keys(availableTools).length === 0) {
       return;
@@ -1128,6 +1125,8 @@ async function loadToolDefinitionsWrapper({
       userMCPAuthMap,
       requestBody: runtimeRequestBody,
       requestScopedConnections,
+      upstreamTokenProvider,
+      oboIdentityContext,
     });
 
     rememberMCPAvailableTools(serverName, result?.availableTools);
@@ -1155,6 +1154,8 @@ async function loadToolDefinitionsWrapper({
       userMCPAuthMap,
       requestBody: runtimeRequestBody,
       requestScopedConnections,
+      upstreamTokenProvider,
+      oboIdentityContext,
     });
 
     rememberMCPAvailableTools(serverName, result?.availableTools);
@@ -1208,14 +1209,19 @@ async function loadToolDefinitionsWrapper({
       for (const sig of functionSignatures) {
         const toolName = `${sig.name}${actionDelimiter}${normalizedDomain}`;
         const legacyToolName = `${sig.name}${actionDelimiter}${legacyNormalized}`;
-        if (!normalizedToolNames.has(toolName) && !normalizedToolNames.has(legacyToolName)) {
+        const matchesCurrentName = normalizedToolNames.has(toolName);
+        const matchesLegacyName = normalizedToolNames.has(legacyToolName);
+        if (!matchesCurrentName && !matchesLegacyName) {
           continue;
         }
 
         definitions.push({
-          name: toolName,
+          /** Keep the selected legacy spelling when that is the only match so
+           * persisted tool_options resolve against the emitted definition. */
+          name: matchesCurrentName ? toolName : legacyToolName,
           description: sig.description,
           parameters: sig.parameters,
+          oauth: action.metadata.auth?.type === AuthTypeEnum.OAuth,
         });
       }
     }
@@ -1223,28 +1229,34 @@ async function loadToolDefinitionsWrapper({
     return definitions;
   };
 
-  let { toolDefinitions, toolRegistry, hasDeferredTools, mcpToolAliases, mcpResolution } =
-    await loadToolDefinitions(
-      {
-        userId: req.user.id,
-        agentId: agent.id,
-        tools: defsFilteredTools,
-        toolOptions: agent.tool_options,
-        deferredToolsEnabled,
-        programmaticToolsEnabled,
-        codeExecutionEnabled,
-        provider: agent.provider,
-        mcpServerNames,
-        rawServerNames: mcpRawServerNames,
-        accessibleServerNames: defsAccessibleServerNames,
-      },
-      {
-        isBuiltInTool,
-        getOrFetchMCPServerTools,
-        refreshMCPServerTools,
-        getActionToolDefinitions,
-      },
-    );
+  let {
+    toolDefinitions,
+    toolRegistry,
+    hasDeferredTools,
+    mcpToolAliases,
+    mcpResolution,
+    oauthActionToolNames,
+  } = await loadToolDefinitions(
+    {
+      userId: req.user.id,
+      agentId: agent.id,
+      tools: defsFilteredTools,
+      toolOptions: agent.tool_options,
+      deferredToolsEnabled,
+      programmaticToolsEnabled,
+      codeExecutionEnabled,
+      provider: agent.provider,
+      mcpServerNames,
+      rawServerNames: mcpRawServerNames,
+      accessibleServerNames: defsAccessibleServerNames,
+    },
+    {
+      isBuiltInTool,
+      getOrFetchMCPServerTools,
+      refreshMCPServerTools,
+      getActionToolDefinitions,
+    },
+  );
 
   /** OAuth discovery must not reconnect (or prompt for) a server whose
    *  definitions the collision filter deliberately rejected. */
@@ -1289,6 +1301,8 @@ async function loadToolDefinitionsWrapper({
           oauthStart,
           oauthEnd: createOAuthEndEmitter(serverName),
           connectionTimeout: Time.TWO_MINUTES,
+          upstreamTokenProvider,
+          oboIdentityContext,
         });
 
         if (result?.availableTools && Object.keys(result.availableTools).length > 0) {
@@ -1338,6 +1352,7 @@ async function loadToolDefinitionsWrapper({
       hasDeferredTools = reloadResult.hasDeferredTools;
       mcpToolAliases = reloadResult.mcpToolAliases;
       mcpResolution = reloadResult.mcpResolution;
+      oauthActionToolNames = reloadResult.oauthActionToolNames;
     }
   }
 
@@ -1454,6 +1469,7 @@ async function loadToolDefinitionsWrapper({
     mcpToolAliases,
     actionsEnabled,
     primedCodeFiles,
+    oauthActionToolNames,
   };
 }
 

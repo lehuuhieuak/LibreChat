@@ -10,7 +10,6 @@ const mockCompletionWakeupHandler = jest.fn().mockResolvedValue(undefined);
 jest.mock('@librechat/api', () => ({
   cacheConfig: { USE_REDIS: true, REDIS_KEY_PREFIX: 'test:' },
   ioredisClient: { duplicate: jest.fn() },
-  isEnabled: jest.fn(() => false),
   registerShutdownTask: jest.fn(),
   duplicateIoRedisClient: jest.fn(),
   createSubagentThreadTaskStore: jest.fn(() => mockTaskStore),
@@ -28,8 +27,10 @@ jest.mock('~/models', () => ({
   deleteConvos: jest.fn(),
   deleteMessages: jest.fn(),
   getConvo: jest.fn(),
+  getSubagentTaskControlReplay: jest.fn(),
   getMessages: jest.fn(),
   listActiveSubagentThreadLeases: jest.fn(),
+  recordSubagentTaskControlReceipt: jest.fn(),
   releaseSubagentThreadLease: jest.fn(),
   reserveSubagentThread: jest.fn(),
   renewSubagentThreadLease: jest.fn(),
@@ -47,7 +48,6 @@ jest.mock('../../Agents/triggers', () => ({
 
 const {
   ioredisClient,
-  isEnabled,
   registerShutdownTask,
   duplicateIoRedisClient,
   createSubagentThreadTaskStore,
@@ -55,23 +55,35 @@ const {
 const subagentThreadTaskStore = require('./subagentThreadStore');
 const { configureSubagentTaskRouting } = subagentThreadTaskStore;
 const taskStoreOptions = createSubagentThreadTaskStore.mock.calls[0][1];
+const taskStoreMethods = createSubagentThreadTaskStore.mock.calls[0][0];
+const db = require('~/models');
 const activityPrepareRegistration = registerShutdownTask.mock.calls.find(
   ([name]) => name === 'subagent activity streams prepare',
 );
+const taskStoreShutdownRegistration = registerShutdownTask.mock.calls.find(
+  ([name]) => name === 'subagent task store',
+);
 
 describe('subagent thread Redis lifecycle', () => {
-  it('reads completion wakeup rollout state at task preparation time', async () => {
-    isEnabled.mockReturnValueOnce(false);
+  it('wires durable control receipt persistence into the host store', () => {
+    expect(taskStoreMethods.recordSubagentTaskControlReceipt).toBe(
+      db.recordSubagentTaskControlReceipt,
+    );
+    expect(taskStoreMethods.getSubagentTaskControlReplay).toBe(db.getSubagentTaskControlReplay);
+  });
 
-    await taskStoreOptions.onTaskPrepared({ taskId: 'disabled' });
-    expect(mockCompletionWakeupHandler).not.toHaveBeenCalled();
-    isEnabled.mockReturnValueOnce(true);
-    await taskStoreOptions.onTaskPrepared({ taskId: 'enabled' });
-    expect(mockCompletionWakeupHandler).toHaveBeenCalledWith({ taskId: 'enabled' });
-    isEnabled.mockReturnValueOnce(true);
-    expect(subagentThreadTaskStore.completionWakeupsEnabled).toBe(true);
-    isEnabled.mockReturnValueOnce(false);
-    expect(subagentThreadTaskStore.completionWakeupsEnabled).toBe(false);
+  it('pre-registers completion wakeups for every prepared task', async () => {
+    await taskStoreOptions.onTaskPrepared({ taskId: 'task-1' });
+
+    expect(mockCompletionWakeupHandler).toHaveBeenCalledWith({ taskId: 'task-1' });
+  });
+
+  it('registers local task-store quiescence independently of optional Redis setup', () => {
+    expect(taskStoreShutdownRegistration).toEqual([
+      'subagent task store',
+      expect.any(Function),
+      { priority: 90 },
+    ]);
   });
 
   it('closes activity SSE before drain and disconnects its subscriber after drain', async () => {
@@ -93,18 +105,16 @@ describe('subagent thread Redis lifecycle', () => {
       expect.any(Function),
       { phase: 'pre-drain', priority: 100 },
     ]);
-    expect(registerShutdownTask).toHaveBeenCalledWith(
-      'subagent task control transport',
+    expect(taskStoreShutdownRegistration).toEqual([
+      'subagent task store',
       expect.any(Function),
       { priority: 90 },
-    );
+    ]);
     const prepare = activityPrepareRegistration[1];
     prepare();
     expect(mockTaskStore.prepareActivityForShutdown).toHaveBeenCalledTimes(1);
 
-    const shutdown = registerShutdownTask.mock.calls.find(
-      ([name]) => name === 'subagent task control transport',
-    )[1];
+    const shutdown = taskStoreShutdownRegistration[1];
     await shutdown();
 
     expect(mockTaskStore.destroyTaskControlTransport).toHaveBeenCalledTimes(1);

@@ -94,6 +94,7 @@ import { assertModelBoundContent } from '../middleware/modelBoundContent';
 import { registerMemoryTools, memoryToolUsageGuard } from './memory';
 import { applyIntentLabels, sanitizeIntentLabels } from './intent';
 import { ContentFilterError } from '../middleware/contentFilter';
+import { PARTIAL_RESOLVED_CONVERSATION } from './guard';
 import { applyBackgroundToolCalls } from './background';
 import { filterFilesByEndpointConfig } from '~/files';
 import { generateArtifactsPrompt } from '~/prompts';
@@ -186,6 +187,32 @@ function appendAdditionalInstructions(agent: Agent, text?: string | null): void 
   agent.additional_instructions = [agent.additional_instructions ?? '', text]
     .filter(Boolean)
     .join('\n\n');
+}
+
+/**
+ * The request middleware already read this conversation once (`null` = looked up, absent).
+ * A stored document without `files` genuinely has none; only the branded lineage-only
+ * partial from a bound agent-event continuation cannot speak for the database.
+ */
+export function readResolvedConversationFiles(
+  req: Pick<ServerRequest, 'resolvedConversation'>,
+  conversationId: string,
+): string[] | undefined {
+  if (!Object.prototype.hasOwnProperty.call(req, 'resolvedConversation')) {
+    return undefined;
+  }
+  const resolved = req.resolvedConversation;
+  if (resolved === null) {
+    return [];
+  }
+  if (
+    resolved == null ||
+    resolved.conversationId !== conversationId ||
+    (resolved as Record<symbol, unknown>)[PARTIAL_RESOLVED_CONVERSATION] === true
+  ) {
+    return undefined;
+  }
+  return resolved.files ?? [];
 }
 
 function getMaxCatalogSkills(req: ServerRequest): number | undefined {
@@ -376,6 +403,10 @@ export type InitializedAgent = Agent & {
    * own and are never listed here.
    */
   intentToolNames?: string[];
+  /** Marker-verified tool names whose model-authored intent labels are safe compaction guidance. */
+  semanticIntentToolNames?: string[];
+  /** Tool names whose unverified schemas veto global semantic-intent trust for same-name calls. */
+  semanticIntentBlockedToolNames?: string[];
   /** Whether the inline memory tools (`set_memory`/`delete_memory`) were
    *  registered for this agent. Authoritative LibreChat-only signal of the
    *  inline memory opt-in for the execution path, since some contexts hold the
@@ -528,6 +559,8 @@ export interface InitializeAgentParams {
     hasDeferredTools?: boolean;
     mcpToolAliases?: MCPToolAlias[];
     actionsEnabled?: boolean;
+    /** Action tool names backed by OAuth — excluded from background dispatch. */
+    oauthActionToolNames?: string[];
     /**
      * Pre-uploaded code-env file refs for the agent's
      * `tool_resources.execute_code`. Bubbled up so the run host can seed
@@ -987,7 +1020,7 @@ export async function initializeAgent(
      * every code-output ref.
      */
     const [convoFileIds, threadMessages] = await Promise.all([
-      db.getConvoFiles(conversationId),
+      readResolvedConversationFiles(req, conversationId) ?? db.getConvoFiles(conversationId),
       needsThreadWalk && getThreadMessages
         ? getThreadMessages({ conversationId }, 'messageId parentMessageId files attachments')
         : null,
@@ -1281,6 +1314,7 @@ export async function initializeAgent(
     hasDeferredTools,
     mcpToolAliases,
     actionsEnabled,
+    oauthActionToolNames,
     tools: structuredTools,
     primedCodeFiles,
   } = loadToolsResult ?? {
@@ -1295,6 +1329,7 @@ export async function initializeAgent(
     hasDeferredTools: false,
     mcpToolAliases: [],
     actionsEnabled: undefined,
+    oauthActionToolNames: undefined,
     primedCodeFiles: undefined,
   };
 
@@ -1490,6 +1525,8 @@ export async function initializeAgent(
   }
 
   let intentToolNames: string[] | undefined;
+  let semanticIntentToolNames: string[] | undefined;
+  let semanticIntentBlockedToolNames: string[] | undefined;
 
   /**
    * Inject the `run_in_background` param into eligible opted-in tools and
@@ -1513,6 +1550,7 @@ export async function initializeAgent(
      *  ephemeral subset: a non-ephemeral name ending in an ephemeral one would
      *  otherwise be misread as ephemeral. */
     const allServerNames = Object.keys(req.config?.mcpConfig ?? {}).map(normalizeServerName);
+    const oauthActionNames = new Set(oauthActionToolNames ?? []);
     const backgroundResult = applyBackgroundToolCalls({
       toolDefinitions,
       toolRegistry,
@@ -1522,8 +1560,13 @@ export async function initializeAgent(
        *  placeholders) never get the param: their connection dies at request
        *  end, so the executor would only downgrade the call to foreground.
        *  Unknown servers stay eligible — the executor's per-instance tag is
-       *  the fail-safe for those. */
+       *  the fail-safe for those. OAuth-backed action tools are excluded too:
+       *  a detached call can block on an interactive login prompt the user
+       *  never sees. */
       excludeTool: (toolName) => {
+        if (oauthActionNames.has(toolName)) {
+          return true;
+        }
         const [, serverName] = splitMCPToolKey(toolName, allServerNames);
         return serverName != null && ephemeralServerNames.has(serverName);
       },
@@ -1664,6 +1707,12 @@ export async function initializeAgent(
     capabilityToolNames,
   });
   toolDefinitions = intentSanitized.toolDefinitions;
+  if (intentSanitized.semanticIntentToolNames.length > 0) {
+    semanticIntentToolNames = intentSanitized.semanticIntentToolNames;
+  }
+  if (intentSanitized.semanticIntentBlockedToolNames.length > 0) {
+    semanticIntentBlockedToolNames = intentSanitized.semanticIntentBlockedToolNames;
+  }
 
   const hasFinalAgentTools =
     (structuredTools?.length ?? 0) > 0 || (toolDefinitions?.length ?? 0) > 0;
@@ -1727,6 +1776,8 @@ export async function initializeAgent(
     mcpToolAliases,
     backgroundToolNames,
     intentToolNames,
+    semanticIntentToolNames,
+    semanticIntentBlockedToolNames,
     actionsEnabled,
     accessibleMcpServerNames: resolvedAuditNames,
     baseContextTokens,

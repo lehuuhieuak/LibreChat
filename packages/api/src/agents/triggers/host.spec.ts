@@ -1,6 +1,10 @@
 import { Constants, EModelEndpoint } from 'librechat-data-provider';
 import { getRequestId, getTenantId, getUserId } from '@librechat/data-schemas';
 import type { AgentTriggerExecutionHostDeps, AgentTriggerFetch } from './host';
+import {
+  EVENT_ACTOR_DETACHED_COMPLETION_SOURCE,
+  EVENT_ACTOR_DETACHED_COMPLETION_TYPE,
+} from './detachedAction';
 import { createAgentTriggerEnvelope, getAgentTriggerIdempotencyKey } from './envelope';
 import { AgentTriggerExecutionError, createAgentTriggerExecutionHost } from './host';
 
@@ -577,8 +581,16 @@ describe('createAgentTriggerExecutionHost continue adapter', () => {
 
   it('carries server-resolved binding identity only on bound child continuations', async () => {
     const base = createContinueEnvelope();
+    if (base.mode !== 'continue') {
+      throw new Error('Expected a continue envelope');
+    }
     const envelope = {
       ...base,
+      event: { ...base.event, payload: { blob: 'x'.repeat(4096) } },
+      expectedAction: {
+        toolName: 'submit_move',
+        argumentSubset: { gameId: 'game-1', expectedPly: 7 },
+      },
       target: {
         ...base.target,
         bindingId: `evtbind_${'a'.repeat(48)}`,
@@ -598,6 +610,74 @@ describe('createAgentTriggerExecutionHost continue adapter', () => {
     const headers = fetcher.mock.calls[0][1]?.headers as Record<string, string>;
     expect(headers['x-lc-agent-event-binding']).toBe(`evtbind_${'a'.repeat(48)}`);
     expect(headers['x-lc-agent-event-source-key']).toBe('source-key');
+    /** The unbounded source payload never rides the delivery body; the actor
+     * binds an invocation from event identity alone. */
+    expect(JSON.parse(String(fetcher.mock.calls[0][1]?.body))).toMatchObject({
+      agentEventDelivery: {
+        deliveryKey: getAgentTriggerIdempotencyKey(envelope),
+        event: {
+          id: envelope.event.id,
+          type: envelope.event.type,
+          occurredAt: envelope.event.occurredAt,
+          source: envelope.event.source,
+        },
+        expectedAction: envelope.expectedAction,
+      },
+    });
+    expect(
+      JSON.parse(String(fetcher.mock.calls[0][1]?.body)).agentEventDelivery.event,
+    ).not.toHaveProperty('payload');
+  });
+
+  it('projects only the bounded internal detached-completion authority', async () => {
+    const base = createContinueEnvelope();
+    if (base.mode !== 'continue') {
+      throw new Error('Expected a continue envelope');
+    }
+    const completion = {
+      version: 1 as const,
+      invocationId: 'original-delivery-1',
+      generationCreatedAt: 1_787_000_000_000,
+      wakeGenerationCreatedAt: 1_787_000_000_000,
+      taskId: 'event-actor-task-1',
+      idempotencyKey: 'a'.repeat(64),
+    };
+    const envelope = {
+      ...base,
+      target: {
+        ...base.target,
+        bindingId: 'binding-1',
+        sourceKeyId: 'source-key-1',
+      },
+      event: {
+        id: completion.taskId,
+        type: EVENT_ACTOR_DETACHED_COMPLETION_TYPE,
+        occurredAt: completion.generationCreatedAt + 1,
+        source: { id: EVENT_ACTOR_DETACHED_COMPLETION_SOURCE, type: 'internal' },
+        payload: completion,
+      },
+      expectedAction: { toolName: 'submit_move' },
+    };
+    const fetcher = fetchMock(async () =>
+      response({
+        streamId: 'conversation-1',
+        conversationId: 'conversation-1',
+        generationCreatedAt: completion.generationCreatedAt + 2,
+        status: 'started',
+      }),
+    );
+    const getBaseUrl = jest.fn(() => 'http://127.0.0.1:3080');
+
+    await createAgentTriggerExecutionHost(deps(fetcher, { getBaseUrl })).dispatch(envelope);
+
+    expect(getBaseUrl).toHaveBeenCalledWith({ localOnly: true });
+    const body = JSON.parse(String(fetcher.mock.calls[0][1]?.body));
+    expect(body.clientRequestId).toBe(getAgentTriggerIdempotencyKey(envelope));
+    expect(body.agentEventDelivery).toMatchObject({
+      deliveryKey: getAgentTriggerIdempotencyKey(envelope),
+      internalCompletion: completion,
+    });
+    expect(body.agentEventDelivery.event).not.toHaveProperty('payload');
   });
 
   it.each(['PARENT_NOT_READY', 'EVENT_ACTOR_NOT_READY'])(

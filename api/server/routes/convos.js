@@ -6,6 +6,10 @@ const {
   deleteAgentCheckpoints,
   createArchiveAllHandler,
   createSubagentActivityStreamHandler,
+  createSubagentControlHandler,
+  isValidSubagentControlRequest,
+  exemptAgentTriggerFromIpLimiter,
+  createParentSubagentIndexHandler,
   createSubagentThreadViewHandler,
   resolveImportMaxFileSize,
   restoreTenantContextFromReq,
@@ -16,6 +20,7 @@ const {
   isContentFilterError,
   contentFilterBlockResponse,
   extractConversationTitleContent,
+  extractStoredMessageContent,
   GenerationJobManager,
   isStopConfirmed,
 } = require('@librechat/api');
@@ -26,6 +31,9 @@ const {
   validateConvoAccess,
   createForkLimiters,
   configMiddleware,
+  messageIpLimiter,
+  messageUserLimiter,
+  moderateText,
 } = require('~/server/middleware');
 const { forkConversation, duplicateConversation } = require('~/server/utils/import/fork');
 const { storage, importFileFilter } = require('~/server/routes/files/multer');
@@ -47,10 +55,69 @@ const subagentThreadViewHandler = createSubagentThreadViewHandler({
   getSubagentThreadForParent: db.getSubagentThreadForParent,
   getMessagesForSubagentThreadView: db.getMessagesForSubagentThreadView,
 });
+const parentSubagentIndexHandler = createParentSubagentIndexHandler({
+  getConvoOwnership: db.getConvoOwnership,
+  listSubagentThreadsForParent: db.listSubagentThreadsForParent,
+  listSubagentTasksForThreads: db.listSubagentTasksForThreads,
+});
 const filterConversationTitle = createContentFilter({
   getFilters: (req) => req.config?.filters,
   extract: (req) => extractConversationTitleContent(req.body),
 });
+const filterSubagentControlMessage = createContentFilter({
+  getFilters: (req) => req.config?.filters,
+  getLegacyPii: (req) => req.config?.messageFilter?.pii,
+  extract: (req) =>
+    ['steer', 'queue', 'interrupt'].includes(req.body?.action)
+      ? extractStoredMessageContent({ text: req.body?.message })
+      : [],
+});
+const unless = (isExempt, middleware) => (req, res, next) =>
+  isExempt(req) ? next() : middleware(req, res, next);
+const subagentControlLimiters = [];
+if (isEnabled(process.env.LIMIT_MESSAGE_IP)) {
+  subagentControlLimiters.push(unless(exemptAgentTriggerFromIpLimiter, messageIpLimiter));
+}
+if (isEnabled(process.env.LIMIT_MESSAGE_USER)) {
+  subagentControlLimiters.push(messageUserLimiter);
+}
+
+function validateSubagentControlRequest(req, res, next) {
+  if (!isValidSubagentControlRequest(req.body)) {
+    return res.status(400).json({ error: 'Invalid subagent control request' });
+  }
+  next();
+}
+
+/** Present guidance to the existing moderation middleware as ordinary user text.
+ * The controller continues to consume `message`; `text` is restored before it runs. */
+async function moderateSubagentControlMessage(req, res, next) {
+  const body = (req.body ??= {});
+  if (!['steer', 'queue', 'interrupt'].includes(body.action)) {
+    next();
+    return;
+  }
+  const hadText = Object.prototype.hasOwnProperty.call(body, 'text');
+  const originalText = body.text;
+  if (typeof body.message === 'string') {
+    body.text = body.message;
+  }
+  const restore = () => {
+    if (hadText) {
+      body.text = originalText;
+    } else {
+      delete body.text;
+    }
+  };
+  try {
+    await moderateText(req, res, (error) => {
+      restore();
+      next(error);
+    });
+  } finally {
+    restore();
+  }
+}
 const subagentActivityStreamHandler = createSubagentActivityStreamHandler(
   {
     getConvoOwnership: db.getConvoOwnership,
@@ -61,6 +128,13 @@ const subagentActivityStreamHandler = createSubagentActivityStreamHandler(
     subscribe: subagentThreadTaskStore.subscribeActivity.bind(subagentThreadTaskStore),
   },
 );
+const subagentControlHandler = createSubagentControlHandler({
+  getConvoOwnership: db.getConvoOwnership,
+  getSubagentThreadForParent: db.getSubagentThreadForParent,
+  getMessages: db.getMessages,
+  getSubagentTaskControlReceipt: db.getSubagentTaskControlReceipt,
+  store: subagentThreadTaskStore,
+});
 router.use(requireJwtAuth);
 
 const isValidProjectFilter = (projectId) =>
@@ -111,6 +185,16 @@ router.get(
   '/:parentConversationId/subagents/:threadId/tasks/:taskId/activity',
   subagentActivityStreamHandler,
 );
+router.post(
+  '/:parentConversationId/subagents/:threadId/control',
+  configMiddleware,
+  ...subagentControlLimiters,
+  validateSubagentControlRequest,
+  filterSubagentControlMessage,
+  moderateSubagentControlMessage,
+  subagentControlHandler,
+);
+router.get('/:parentConversationId/subagents', parentSubagentIndexHandler);
 router.get('/:parentConversationId/subagents/:threadId', subagentThreadViewHandler);
 
 router.get('/:conversationId', async (req, res) => {

@@ -69,6 +69,26 @@ const MAX_ASK_ANSWER_LENGTH = 16_000;
 const ASK_QUESTION_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 const MAX_ASK_QUESTIONS = 4;
 
+function getBoundedAskUserAnswerEntries(answers: unknown): Array<[string, string]> | undefined {
+  if (answers == null || typeof answers !== 'object' || Array.isArray(answers)) {
+    return undefined;
+  }
+  const entries = Object.entries(answers);
+  if (
+    entries.length === 0 ||
+    entries.length > MAX_ASK_QUESTIONS ||
+    entries.some(([, value]) => typeof value !== 'string' || value.length > MAX_ASK_ANSWER_LENGTH)
+  ) {
+    return undefined;
+  }
+  return entries as Array<[string, string]>;
+}
+
+/** Return batched ask-user values when their count and length are bounded. */
+export function getBoundedAskUserAnswerValues(answers: unknown): string[] {
+  return getBoundedAskUserAnswerEntries(answers)?.map(([, value]) => value) ?? [];
+}
+
 /**
  * Serialize every ordering a validated batch can take after the SDK rebuilds
  * its answer map in question order. Batches are capped at four questions, so
@@ -76,22 +96,15 @@ const MAX_ASK_QUESTIONS = 4;
  * checks inspect the exact ToolMessage even for a crafted key order.
  */
 export function serializeAskUserAnswerVariants(answers: unknown): string[] {
-  if (answers == null || typeof answers !== 'object' || Array.isArray(answers)) {
-    return [];
-  }
-  const entries = Object.entries(answers);
-  if (
-    entries.length === 0 ||
-    entries.length > MAX_ASK_QUESTIONS ||
-    entries.some(([, value]) => typeof value !== 'string')
-  ) {
+  const entries = getBoundedAskUserAnswerEntries(answers);
+  if (entries == null) {
     return [];
   }
 
   const variants: string[] = [];
-  const visit = (remaining: Array<[string, unknown]>, ordered: Array<[string, unknown]>) => {
+  const visit = (remaining: Array<[string, string]>, ordered: Array<[string, string]>) => {
     if (remaining.length === 0) {
-      const normalized = Object.create(null) as Record<string, unknown>;
+      const normalized = Object.create(null) as Record<string, string>;
       for (const [key, value] of ordered) {
         normalized[key] = value;
       }
@@ -324,7 +337,7 @@ type ResumableRunStep = {
 
 export function normalizeResumeRunStepIndices<T extends ResumableRunStep>(
   runSteps: readonly T[],
-  seedContent: readonly { type?: string; tool_call?: { id?: string } }[] = [],
+  seedContent: readonly ({ type?: string; tool_call?: { id?: string } } | undefined)[] = [],
 ): T[] {
   const toolCallIndices = new Map<string, number>();
   seedContent.forEach((part, index) => {
@@ -361,7 +374,7 @@ export function hydrateResumeRunSteps(
   runSteps: readonly RunStep[],
   stepMap: Map<string, RunStep | undefined> | undefined,
   graph: { toolCallStepIds?: Map<string, string> } | null | undefined,
-  seedContent: readonly { type?: string; tool_call?: { id?: string } }[] = [],
+  seedContent: readonly ({ type?: string; tool_call?: { id?: string } } | undefined)[] = [],
 ): void {
   for (const runStep of normalizeResumeRunStepIndices(runSteps, seedContent)) {
     if (!runStep?.id) {
