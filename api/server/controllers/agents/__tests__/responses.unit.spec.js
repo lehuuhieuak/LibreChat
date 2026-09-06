@@ -196,6 +196,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  createAgentExecutionContext: (context) => context,
   SAFE_CONVERSATION_TITLE: 'New Chat',
   resolveConversationTitle: (...args) => mockResolveConversationTitle(...args),
   /** Pass-through: the controller strips UI-only activity-label parts
@@ -222,7 +223,7 @@ jest.mock('@librechat/api', () => ({
   }),
   buildInitialToolSessions: jest.fn().mockReturnValue(mockInitialSessions),
   applyContextToAgent: (...args) => mockApplyContextToAgent(...args),
-  buildToolSet: jest.fn().mockReturnValue(new Set()),
+  buildRunToolSet: jest.fn().mockReturnValue(new Set()),
   AgentRunEnvelopeError: MockAgentRunEnvelopeError,
   createAgentRunEnvelope: (...args) => mockCreateAgentRunEnvelope(...args),
   createMCPRuntimeRequestBody: ({ messageId, conversationId, parentMessageId }) => ({
@@ -288,6 +289,7 @@ jest.mock('@librechat/api', () => ({
     alwaysApplyDedupedFromManual: 0,
   }),
   createToolExecuteHandler: jest.fn().mockReturnValue({ handle: jest.fn() }),
+  resolveRecursionLimit: jest.fn().mockReturnValue(50),
   // Responses API
   writeDone: jest.fn(),
   buildResponse: jest.fn().mockReturnValue({ id: 'resp_123', output: [] }),
@@ -312,6 +314,14 @@ jest.mock('@librechat/api', () => ({
   hasModelBoundContentProtection: mockHasModelBoundContentProtection,
   isContentFilterError: jest.fn((error) => error?.code === 'content_filter_block'),
   getSafeErrorMetadata: mockGetSafeErrorMetadata,
+  /** Mirrors the real helper's contract: generic copy under content protection, otherwise the
+   *  provider's own message. Stripping of LangChain's docs URL is covered in its own unit test. */
+  getUserFacingProviderError: (error, protectionEnabled) => {
+    if (protectionEnabled) {
+      return 'An error occurred while processing the request';
+    }
+    return error instanceof Error ? error.message : 'An error occurred';
+  },
   contentFilterBlockResponse: jest.fn().mockReturnValue({
     error: 'content_filter_block',
     message: 'Submitted content was blocked.',
@@ -361,7 +371,48 @@ jest.mock('@librechat/api', () => ({
     on_run_step_delta: { handle: jest.fn() },
     on_chat_model_end: { handle: jest.fn() },
   }),
-  enrollAgentExecution: (...args) => mockEnrollAgentExecution(...args),
+  executeAgentRun: async ({
+    envelope,
+    runId,
+    conversationId,
+    connection,
+    isPrincipalActive,
+    execute,
+    handleExecutionError,
+    beforeSettle,
+  }) => {
+    let execution;
+    let executionError;
+    let closed = connection?.isClosed() ?? false;
+    const removeCloseListener =
+      connection?.onClose(() => {
+        closed = true;
+        execution?.abort();
+      }) ?? (() => undefined);
+    try {
+      execution = await mockEnrollAgentExecution({
+        runId,
+        userId: envelope.principal.userId,
+        conversationId,
+        agentId: envelope.payload.model,
+        protocol: envelope.protocol,
+        isPrincipalActive,
+      });
+      if (closed || connection?.isClosed() === true) execution.abort();
+      await execution.beginProviderExecution();
+      return await execute(execution);
+    } catch (error) {
+      executionError = error;
+      if (handleExecutionError) return await handleExecutionError(error);
+      throw error;
+    } finally {
+      removeCloseListener();
+      if (execution) {
+        await beforeSettle?.(execution, executionError);
+        await execution.settle(executionError);
+      }
+    }
+  },
   waitForAgentExecutionWrites: async (writes) => {
     const results = await Promise.allSettled(writes);
     const failure = results.find((result) => result.status === 'rejected');
@@ -659,6 +710,21 @@ describe('createResponse controller', () => {
     );
   });
 
+  it('invokes the graph with the resolved recursion limit rather than the SDK default', async () => {
+    const api = require('@librechat/api');
+    const processStream = jest.fn().mockResolvedValue(undefined);
+    api.createRun.mockResolvedValueOnce({ processStream });
+    api.resolveRecursionLimit.mockReturnValueOnce(123);
+
+    await createResponse(req, res);
+
+    expect(processStream).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ recursionLimit: 123 }),
+      expect.anything(),
+    );
+  });
+
   it('returns 503 when an agent expects MCP tools but resolves none', async () => {
     const { initializeAgent, sendResponsesErrorResponse } = require('@librechat/api');
     const { loadAgentTools } = require('~/server/services/ToolService');
@@ -749,9 +815,10 @@ describe('createResponse controller', () => {
       req.user = {
         id: 'user-123',
         role: 'USER',
-        tenantId: 'tenant-123',
+        tenantId: 'stale-user-tenant',
         federatedTokens: { access_token: 'secret' },
       };
+      req.tenantId = 'request-tenant';
       const requestBody = {
         ...req.body,
         ephemeralAgent: { skills: true },
@@ -768,7 +835,10 @@ describe('createResponse controller', () => {
       expect(mockCreateAgentRunEnvelope).toHaveBeenCalledWith(
         expect.objectContaining({
           protocol: 'responses',
-          principal: req.user,
+          principal: {
+            ...req.user,
+            tenantId: 'request-tenant',
+          },
           payload: requestBody,
           requestId: expect.any(String),
           receivedAt: expect.any(Number),
@@ -779,6 +849,9 @@ describe('createResponse controller', () => {
       );
       expect(initializeAgent).toHaveBeenCalledWith(
         expect.objectContaining({
+          runtime: expect.objectContaining({
+            turnStartedAt: mockCreateAgentRunEnvelope.mock.results[0].value.receivedAt,
+          }),
           requestBody: {
             messageId: 'resp_mock-123',
             conversationId: expect.any(String),
@@ -786,6 +859,7 @@ describe('createResponse controller', () => {
         }),
         expect.anything(),
       );
+      expect(req.turnStartedAt).toBe(mockCreateAgentRunEnvelope.mock.results[0].value.receivedAt);
       expect(req.body).not.toBe(requestBody);
       expect(req.body).toEqual(requestBody);
       expect(JSON.stringify(mockCreateAgentRunEnvelope.mock.results[0].value)).not.toContain(

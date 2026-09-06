@@ -71,24 +71,6 @@ const baseDefinitions: Record<string, SettingDefinition> = {
     minTags: 0,
     maxTags: 4,
   },
-  imageDetail: {
-    key: 'imageDetail',
-    label: 'com_endpoint_plug_image_detail',
-    labelCode: true,
-    description: 'com_endpoint_openai_detail',
-    descriptionCode: true,
-    type: 'enum',
-    default: ImageDetail.auto,
-    component: 'slider',
-    options: [ImageDetail.low, ImageDetail.auto, ImageDetail.high],
-    enumMappings: {
-      [ImageDetail.low]: 'com_ui_low',
-      [ImageDetail.auto]: 'com_ui_auto',
-      [ImageDetail.high]: 'com_ui_high',
-    },
-    optionType: 'conversation',
-    columnSpan: 2,
-  },
 };
 
 const createDefinition = (
@@ -147,6 +129,26 @@ export const librechat = {
     placeholderCode: true,
     optionType: 'model',
   } as const,
+  /** Controls how LibreChat encodes image content blocks, not a provider request
+   * parameter — so it belongs to this group and is stripped from model options. */
+  imageDetail: {
+    key: 'imageDetail',
+    label: 'com_endpoint_plug_image_detail',
+    labelCode: true,
+    description: 'com_endpoint_openai_detail',
+    descriptionCode: true,
+    type: 'enum',
+    default: ImageDetail.auto,
+    component: 'slider',
+    options: [ImageDetail.low, ImageDetail.auto, ImageDetail.high],
+    enumMappings: {
+      [ImageDetail.low]: 'com_ui_low',
+      [ImageDetail.auto]: 'com_ui_auto',
+      [ImageDetail.high]: 'com_ui_high',
+    },
+    optionType: 'conversation',
+    columnSpan: 2,
+  } as SettingDefinition,
   fileTokenLimit: {
     key: 'fileTokenLimit',
     label: 'com_ui_file_token_limit',
@@ -887,7 +889,7 @@ const openAI: SettingsConfiguration = [
   openAIParams.presence_penalty,
   baseDefinitions.stop,
   librechat.resendFiles,
-  baseDefinitions.imageDetail,
+  librechat.imageDetail,
   openAIParams.web_search,
   openAIParams.reasoning_effort,
   openAIParams.useResponsesApi,
@@ -920,7 +922,7 @@ const openAICol2: SettingsConfiguration = [
   openAIParams.presence_penalty,
   baseDefinitions.stop,
   librechat.resendFiles,
-  baseDefinitions.imageDetail,
+  librechat.imageDetail,
   openAIParams.reasoning_effort,
   openAIParams.reasoning_summary,
   openAIParams.reasoning_mode,
@@ -1187,6 +1189,48 @@ export const paramSettings: Record<string, SettingsConfiguration | undefined> = 
   [`${EModelEndpoint.bedrock}-${BedrockProviders.ZAI}`]: bedrockZAI,
   [EModelEndpoint.google]: googleConfig,
 };
+
+/**
+ * Maps effective backend param names for OpenAI-compatible/Azure endpoints (as deleted from
+ * `llmConfig` via `dropParams`, e.g. `maxTokens`) to their corresponding UI/conversation keys
+ * (e.g. `max_tokens`). Native providers (anthropic, google, bedrock, ...) already render these
+ * same camelCase names as their UI key (e.g. `topP`), so this alias must only be applied to
+ * OpenAI-compatible parameter sets — see `resolveDropParamsUIKeys`.
+ */
+const dropParamsBackendToUIKey: Record<string, string> = {
+  maxTokens: 'max_tokens',
+  topP: 'top_p',
+  frequencyPenalty: 'frequency_penalty',
+  presencePenalty: 'presence_penalty',
+};
+
+/** Endpoint keys whose parameter settings render the OpenAI-compatible (snake_case) UI keys. */
+const openAILikeParamEndpointKeys: Set<string> = new Set([
+  EModelEndpoint.openAI,
+  EModelEndpoint.azureOpenAI,
+  EModelEndpoint.custom,
+  Providers.OPENROUTER,
+]);
+
+/**
+ * Normalizes an admin-configured `dropParams` list into the UI/conversation keys used to hide
+ * the matching controls in the settings panels. `endpointKey` should be the same key used to
+ * resolve the panel's parameter settings (e.g. `overriddenEndpointKey`); the backend-name alias
+ * is only applied for OpenAI-compatible endpoints, since native providers (anthropic, google,
+ * bedrock, ...) already use these backend names as their UI key.
+ */
+export function resolveDropParamsUIKeys(
+  dropParams: string[] | undefined,
+  endpointKey: string,
+): Set<string> {
+  if (!dropParams || dropParams.length === 0) {
+    return new Set();
+  }
+  if (!openAILikeParamEndpointKeys.has(endpointKey)) {
+    return new Set(dropParams);
+  }
+  return new Set(dropParams.map((param) => dropParamsBackendToUIKey[param] ?? param));
+}
 
 const openAIColumns = {
   col1: openAICol1,

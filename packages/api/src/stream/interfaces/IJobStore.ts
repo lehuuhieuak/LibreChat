@@ -1,10 +1,13 @@
 import type {
+  IAgentEventActorContextMeta,
+  ICompactionSemanticIndexProjection,
+} from '@librechat/data-schemas';
+import type {
   Agents,
   TFile,
   TPendingSteer,
   UserSubmittedMessageFieldPath,
 } from 'librechat-data-provider';
-import type { ICompactionSemanticIndexProjection } from '@librechat/data-schemas';
 import type { RunStep, StandardGraph } from '@librechat/agents';
 import type { AgentEventDetachedTerminalEvidence } from '~/agents/triggers/types';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
@@ -177,6 +180,8 @@ export interface SerializableJobData {
   activityPhaseSnapshot?: ActivityPhaseSnapshot;
   /** Exact bounded compaction guidance captured atomically with a HITL pause. */
   compactionSemanticIndex?: ICompactionSemanticIndexProjection;
+  /** Calibration and fading state captured atomically with a HITL pause, so a resume seeds its rebuilt pruner from the same tier. */
+  contextMeta?: IAgentEventActorContextMeta;
   /**
    * Whether the replica that OWNS this generation can seal mid-stream
    * (`PreemptBoundary` wiring). Recorded at createJob because the steer route
@@ -456,6 +461,7 @@ export type JobMetadataPatch = Partial<
     | 'discoveredTools'
     | 'activityPhaseSnapshot'
     | 'compactionSemanticIndex'
+    | 'contextMeta'
     | 'preemptCapable'
     | 'steerQuotesCapable'
     | 'steerQuotesExecutionId'
@@ -560,6 +566,15 @@ export type SteerEnqueueReceiptResult = SteerReceipt | SteerEnqueueResult | numb
 export interface SteerEnqueueResult {
   item: SteerQueueItem;
   position: number;
+}
+
+export type TerminalSteerAdmissionResult =
+  | { outcome: 'claimed'; items: SteerQueueItem[] }
+  | { outcome: 'open' | 'sealed' | 'unavailable' };
+
+export interface TerminalSteerAdmissionPolicy {
+  allowClaim: boolean;
+  keepOpenWhenEmpty: boolean;
 }
 
 export type SteerEnqueueVersionedResult = SteerEnqueueResult | number;
@@ -851,6 +866,8 @@ export interface ResumeState {
     data?: unknown;
     [key: string]: unknown;
   }>;
+  /** Pending MCP authorization prompts projected from durable stream state. */
+  pendingOAuthPrompts?: Agents.PendingMCPOAuthPrompt[];
 }
 
 /**
@@ -893,6 +910,10 @@ export interface IJobStore {
    * request-rate admission. Optional stores keep the conservative behavior
    * where every request remains subject to the limiter. */
   hasIdempotencyKey?(key: string): Promise<boolean>;
+
+  /** Read-only claim receipt used by durable source reconcilers. Optional
+   * stores fall back to inspecting the current generation only. */
+  getIdempotencyClaim?(key: string): Promise<IdempotencyClaimValue | null>;
 
   deleteJob(streamId: string, expectedCreatedAt?: number): Promise<boolean>;
   hasJob(streamId: string): Promise<boolean>;
@@ -1389,6 +1410,21 @@ export interface IJobStoreV2 extends IJobStore {
   ): Promise<boolean>;
 
   /**
+   * Terminal admission fence. When `allowClaim` and queued work are both
+   * present, atomically claim the FIFO batch while leaving admission open for
+   * the continued run. Otherwise atomically close admission so a racing steer
+   * is rejected and remains an ordinary follow-up, unless
+   * `keepOpenWhenEmpty` proves another folded Stop hook already planned a
+   * continuation. V1 generations always seal because they lack
+   * crash-recoverable claimed-steer receipts.
+   */
+  admitTerminalSteers(
+    streamId: string,
+    policy: TerminalSteerAdmissionPolicy,
+    expectedCreatedAt?: number,
+  ): Promise<TerminalSteerAdmissionResult>;
+
+  /**
    * Atomically CLOSE the queue to new steers, then take all queued items
    * FIFO. Used by the terminal paths (final event, abort) so a steer POST
    * racing finalization can never be 202-ACKed after the last drain and then
@@ -1501,6 +1537,27 @@ export interface IJobStoreV2 extends IJobStore {
 
   /** Drop any queued steers (terminal cleanup backstop). */
   clearSteers(streamId: string): Promise<void>;
+}
+
+export type GenerationTerminalEventType = 'done' | 'error';
+
+/** A terminal publication lost the generation fence to a replacement. This is
+ * an expected safety outcome: the successor owns all further stream output. */
+export class GenerationPublicationFencedError extends Error {
+  readonly code = 'GENERATION_PUBLICATION_FENCED';
+
+  constructor(
+    readonly eventType: GenerationTerminalEventType,
+    readonly streamId: string,
+    readonly generationId?: number,
+  ) {
+    super(
+      eventType === 'done'
+        ? 'Generation DONE publication was fenced by a replacement'
+        : 'Generation error publication was fenced by a replacement',
+    );
+    this.name = 'GenerationPublicationFencedError';
+  }
 }
 
 /**

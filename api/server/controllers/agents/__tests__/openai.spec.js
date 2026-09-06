@@ -173,6 +173,7 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  createAgentExecutionContext: (context) => context,
   collectReachableAgents: (roots) => {
     const agents = [];
     const pending = [...roots];
@@ -202,7 +203,7 @@ jest.mock('@librechat/api', () => ({
   buildAgentContextAttachmentsByAgentId: (...args) =>
     mockBuildAgentContextAttachmentsByAgentId(...args),
   createChunk: jest.fn().mockReturnValue({}),
-  buildToolSet: jest.fn().mockReturnValue(new Set()),
+  buildRunToolSet: jest.fn().mockReturnValue(new Set()),
   buildInitialToolSessions: jest.fn().mockReturnValue(mockInitialSessions),
   AgentRunEnvelopeError: MockAgentRunEnvelopeError,
   createAgentRunEnvelope: (...args) => mockCreateAgentRunEnvelope(...args),
@@ -278,6 +279,14 @@ jest.mock('@librechat/api', () => ({
   hasModelBoundContentProtection: mockHasModelBoundContentProtection,
   isContentFilterError: jest.fn((error) => error?.code === 'content_filter_block'),
   getSafeErrorMetadata: mockGetSafeErrorMetadata,
+  /** Mirrors the real helper's contract: generic copy under content protection, otherwise the
+   *  provider's own message. Stripping of LangChain's docs URL is covered in its own unit test. */
+  getUserFacingProviderError: (error, protectionEnabled) => {
+    if (protectionEnabled) {
+      return 'An error occurred while processing the request';
+    }
+    return error instanceof Error ? error.message : 'An error occurred';
+  },
   contentFilterBlockResponse: jest.fn().mockReturnValue({
     error: 'content_filter_block',
     message: 'Submitted content was blocked.',
@@ -295,7 +304,48 @@ jest.mock('@librechat/api', () => ({
     userMCPAuthMap: undefined,
   }),
   resolveSubagentGraphs: jest.fn().mockResolvedValue(undefined),
-  enrollAgentExecution: (...args) => mockEnrollAgentExecution(...args),
+  executeAgentRun: async ({
+    envelope,
+    runId,
+    conversationId,
+    connection,
+    isPrincipalActive,
+    execute,
+    handleExecutionError,
+    beforeSettle,
+  }) => {
+    let execution;
+    let executionError;
+    let closed = connection?.isClosed() ?? false;
+    const removeCloseListener =
+      connection?.onClose(() => {
+        closed = true;
+        execution?.abort();
+      }) ?? (() => undefined);
+    try {
+      execution = await mockEnrollAgentExecution({
+        runId,
+        userId: envelope.principal.userId,
+        conversationId,
+        agentId: envelope.payload.model,
+        protocol: envelope.protocol,
+        isPrincipalActive,
+      });
+      if (closed || connection?.isClosed() === true) execution.abort();
+      await execution.beginProviderExecution();
+      return await execute(execution);
+    } catch (error) {
+      executionError = error;
+      if (handleExecutionError) return await handleExecutionError(error);
+      throw error;
+    } finally {
+      removeCloseListener();
+      if (execution) {
+        await beforeSettle?.(execution, executionError);
+        await execution.settle(executionError);
+      }
+    }
+  },
   waitForAgentExecutionWrites: async (writes) => {
     const results = await Promise.allSettled(writes);
     const failure = results.find((result) => result.status === 'rejected');
@@ -1282,9 +1332,10 @@ describe('OpenAIChatCompletionController', () => {
       req.user = {
         id: 'user-123',
         role: 'USER',
-        tenantId: 'tenant-123',
+        tenantId: 'stale-user-tenant',
         federatedTokens: { access_token: 'secret' },
       };
+      req.tenantId = 'request-tenant';
       const requestBody = {
         ...req.body,
         ephemeralAgent: { skills: true },
@@ -1300,7 +1351,10 @@ describe('OpenAIChatCompletionController', () => {
       expect(mockCreateAgentRunEnvelope).toHaveBeenCalledWith(
         expect.objectContaining({
           protocol: 'chat.completions',
-          principal: req.user,
+          principal: {
+            ...req.user,
+            tenantId: 'request-tenant',
+          },
           payload: requestBody,
           requestId: expect.any(String),
           receivedAt: expect.any(Number),
@@ -1309,6 +1363,15 @@ describe('OpenAIChatCompletionController', () => {
       expect(mockCreateAgentRunEnvelope.mock.invocationCallOrder[0]).toBeLessThan(
         initializeAgent.mock.invocationCallOrder[0],
       );
+      expect(initializeAgent).toHaveBeenCalledWith(
+        expect.objectContaining({
+          runtime: expect.objectContaining({
+            turnStartedAt: mockCreateAgentRunEnvelope.mock.results[0].value.receivedAt,
+          }),
+        }),
+        expect.anything(),
+      );
+      expect(req.turnStartedAt).toBe(mockCreateAgentRunEnvelope.mock.results[0].value.receivedAt);
       expect(req.body).not.toBe(requestBody);
       expect(req.body).toEqual(requestBody);
       expect(JSON.stringify(mockCreateAgentRunEnvelope.mock.results[0].value)).not.toContain(

@@ -13,6 +13,7 @@ const {
   sendUploadPolicyError,
   resolveUploadErrorMessage,
   verifyAgentUploadPermission,
+  createCodeExecutionRouteKey,
   getCodeExecutionBaseUrl,
   assertUploadContentAllowed,
   hasActiveFilePolicy,
@@ -288,10 +289,10 @@ router.delete('/', async (req, res) => {
     /* Handle assistant unlinking even if no valid files to delete */
     if (req.body.assistant_id && req.body.tool_resource && dbFiles.length === 0) {
       const assistant = await db.getAssistant({
-        id: req.body.assistant_id,
+        assistantId: req.body.assistant_id,
       });
 
-      const toolResourceFiles = assistant.tool_resources?.[req.body.tool_resource]?.file_ids ?? [];
+      const toolResourceFiles = assistant?.tool_resources?.[req.body.tool_resource]?.file_ids ?? [];
       const assistantFiles = files.filter((f) => toolResourceFiles.includes(f.file_id));
 
       const result = await processDeleteRequest({ req, files: assistantFiles });
@@ -350,7 +351,29 @@ router.get('/code/download/:session_id/:fileId', async (req, res) => {
       return res.status(400).send('Bad request');
     }
     const executionProfile = requestedProfile ?? 'default';
-    const baseUrl = getCodeExecutionBaseUrl(executionProfile);
+    const requestedRouteKey = req.query.execution_route_key;
+    if (
+      requestedRouteKey != null &&
+      (typeof requestedRouteKey !== 'string' ||
+        executionProfile !== 'stateful' ||
+        !/^stateful:[a-f0-9]{32}$/.test(requestedRouteKey))
+    ) {
+      logger.debug(`${logPrefix} invalid execution_route_key`);
+      return res.status(400).send('Bad request');
+    }
+    const environments =
+      req.config?.endpoints?.[EModelEndpoint.agents]?.statefulCodeSessions?.environments;
+    const configuredEnvironment = requestedRouteKey
+      ? environments?.find(
+          (environment) =>
+            createCodeExecutionRouteKey('stateful', environment) === requestedRouteKey,
+        )
+      : undefined;
+    if (requestedRouteKey && !configuredEnvironment) {
+      logger.debug(`${logPrefix} unknown execution_route_key`);
+      return res.status(404).send('Not found');
+    }
+    const baseUrl = getCodeExecutionBaseUrl(executionProfile, configuredEnvironment);
 
     const { getDownloadStream } = getStrategyFunctions(FileSources.execute_code);
     if (!getDownloadStream) {
@@ -375,7 +398,16 @@ router.get('/code/download/:session_id/:fileId', async (req, res) => {
         id: req.user.id,
       },
       req,
-      { baseUrl, executionProfile },
+      {
+        baseUrl,
+        executionProfile,
+        ...((configuredEnvironment?.workerId ?? configuredEnvironment?.pairing?.workerId) != null
+          ? {
+              bridgeWorkerId:
+                configuredEnvironment?.workerId ?? configuredEnvironment?.pairing?.workerId,
+            }
+          : {}),
+      },
     );
     res.setHeader('Content-Disposition', 'attachment');
     res.setHeader('Content-Type', 'application/octet-stream');

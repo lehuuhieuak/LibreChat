@@ -44,8 +44,12 @@ const {
   isNormalizationSensitiveName,
   AGENT_EXPECTED_MCP_TOOLS_UNAVAILABLE,
   isFatalAgentInitializationError,
+  codeExecutionAuthHeaders,
+  createAttachedWorkspaceBashTool,
   resolveCodeExecutionContext,
   resolveCallerCapabilityProjectionSnapshot,
+  LIST_WORKSPACE_FILES_TOOL_NAME,
+  SEARCH_WORKSPACE_TOOL_NAME,
   getTransactionsConfig,
 } = require('@librechat/api');
 const {
@@ -195,7 +199,7 @@ const prepareActionSnapshotForTools = async ({ agentId, toolNames, filters, decr
   if (!toolNames.some((toolName) => isActionTool(toolName))) {
     return null;
   }
-  const storedActions = (await loadActionSets({ agent_id: agentId })) ?? [];
+  const storedActions = (await loadActionSets({ agentId })) ?? [];
   if (storedActions.length === 0) {
     return { storedActions, actionSets: [] };
   }
@@ -514,7 +518,7 @@ async function processRequiredActions(client, requiredActions) {
         /** @type {Action[]} */
         const storedActions =
           (await loadActionSets({
-            assistant_id: client.req.body.assistant_id,
+            assistantId: client.req.body.assistant_id,
           })) ?? [];
         const actionSets = await prepareStoredActionsForUse({
           actions: storedActions,
@@ -785,6 +789,8 @@ async function loadToolDefinitionsWrapper({
         enabledCapabilities.has(AgentCapabilities.stateful_code_sessions) &&
         agent.stateful_code_sessions === true,
       environment: agent.stateful_code_environment,
+      environmentId: agent.code_environment_id,
+      environments: req.config?.endpoints?.agents?.statefulCodeSessions?.environments,
       userId: req.user.id,
       agentId: agent.id,
       conversationId: runtimeRequestBody?.conversationId,
@@ -1370,9 +1376,7 @@ async function loadToolDefinitionsWrapper({
 
   if (hasWebSearch) {
     toolContextMap[Tools.web_search] = buildWebSearchContext();
-    dynamicToolContextMap[Tools.web_search] = buildWebSearchDynamicContext(
-      req.conversationCreatedAt,
-    );
+    dynamicToolContextMap[Tools.web_search] = buildWebSearchDynamicContext(req.turnStartedAt);
   }
 
   /**
@@ -1392,6 +1396,10 @@ async function loadToolDefinitionsWrapper({
         agentResourceType,
         codeApiBaseUrl: resolvedCodeExecutionContext.baseUrl,
         executionProfile: resolvedCodeExecutionContext.executionProfile,
+        executionRouteKey: resolvedCodeExecutionContext.executionRouteKey,
+        ...(resolvedCodeExecutionContext.bridgeWorkerId
+          ? { bridgeWorkerId: resolvedCodeExecutionContext.bridgeWorkerId }
+          : {}),
       });
       if (toolContext) {
         dynamicToolContextMap[Tools.execute_code] = toolContext;
@@ -1642,6 +1650,8 @@ async function loadAgentTools({
     resolveCodeExecutionContext({
       statefulSessions: statefulCodeSessions,
       environment: agent.stateful_code_environment,
+      environmentId: agent.code_environment_id,
+      environments: req.config?.endpoints?.agents?.statefulCodeSessions?.environments,
       userId: req.user.id,
       agentId: agent.id,
       conversationId: requestBody?.conversationId ?? req.body?.conversationId,
@@ -1689,7 +1699,11 @@ async function loadAgentTools({
       deferredToolsEnabled,
       programmaticToolsEnabled,
       codeExecutionEnabled,
-      authHeaders: () => getCodeApiAuthHeaders(req),
+      authHeaders: () =>
+        codeExecutionAuthHeaders(
+          (bridgeWorkerId) => getCodeApiAuthHeaders(req, bridgeWorkerId),
+          codeExecutionContext,
+        ),
       codeExecutionContext,
     });
 
@@ -1989,7 +2003,13 @@ async function loadToolsForExecution({
   const isPTCRequested = ptcToolNames.length > 0;
   const isBashToolRequested = toolNames.includes(AgentConstants.BASH_TOOL);
   const isLegacyExecuteCodeRequested = toolNames.includes(Tools.execute_code);
-  const isCodeExecutionToolRequested = isBashToolRequested || isLegacyExecuteCodeRequested;
+  const isWorkspaceSearchRequested = toolNames.includes(SEARCH_WORKSPACE_TOOL_NAME);
+  const isWorkspaceListRequested = toolNames.includes(LIST_WORKSPACE_FILES_TOOL_NAME);
+  const isCodeExecutionToolRequested =
+    isBashToolRequested ||
+    isLegacyExecuteCodeRequested ||
+    isWorkspaceSearchRequested ||
+    isWorkspaceListRequested;
   const isSkillToolRequested = toolNames.includes(AgentConstants.SKILL_TOOL);
   const isSandboxFileToolRequested = toolNames.some((name) =>
     [AgentConstants.READ_FILE, AgentConstants.CREATE_FILE, AgentConstants.EDIT_FILE].includes(name),
@@ -2022,6 +2042,8 @@ async function loadToolsForExecution({
   const codeExecutionContext = resolveCodeExecutionContext({
     statefulSessions: statefulCodeSessions,
     environment: agent?.stateful_code_environment,
+    environmentId: agent?.code_environment_id,
+    environments: req.config?.endpoints?.agents?.statefulCodeSessions?.environments,
     userId: req.user.id,
     agentId: agent?.id,
     conversationId: conversationId ?? runtimeRequestBody?.conversationId,
@@ -2072,7 +2094,11 @@ async function loadToolsForExecution({
        */
       for (const name of ptcToolNames) {
         const ptcTool = createBashProgrammaticToolCallingTool({
-          authHeaders: () => getCodeApiAuthHeaders(req),
+          authHeaders: () =>
+            codeExecutionAuthHeaders(
+              (bridgeWorkerId) => getCodeApiAuthHeaders(req, bridgeWorkerId),
+              codeExecutionContext,
+            ),
           baseUrl: codeExecutionContext.baseUrl,
           executionProfile: codeExecutionContext.executionProfile,
           runtimeSessionHint: codeExecutionContext.runtimeSessionHint,
@@ -2097,10 +2123,21 @@ async function loadToolsForExecution({
   }
   if (isBashTool) {
     try {
-      const bashTool = createBashExecutionTool({
-        authHeaders: () => getCodeApiAuthHeaders(req),
-        ...codeExecutionContext,
-      });
+      const authHeaders = () =>
+        codeExecutionAuthHeaders(
+          (bridgeWorkerId) => getCodeApiAuthHeaders(req, bridgeWorkerId),
+          codeExecutionContext,
+        );
+      const bashTool =
+        codeExecutionContext.environmentType === 'attached'
+          ? createAttachedWorkspaceBashTool({
+              authHeaders,
+              baseUrl: codeExecutionContext.baseUrl,
+            })
+          : createBashExecutionTool({
+              authHeaders,
+              ...codeExecutionContext,
+            });
       allLoadedTools.push(bashTool);
     } catch (error) {
       logger.error(

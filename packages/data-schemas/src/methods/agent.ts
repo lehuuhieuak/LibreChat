@@ -8,7 +8,8 @@ import {
 } from 'librechat-data-provider';
 import type { FilterQuery, Model, PipelineStage, ProjectionType, Types } from 'mongoose';
 import type { AgentToolResources } from 'librechat-data-provider';
-import type { IAgent, IAclEntry } from '~/types';
+import type { IAgent, IAclEntry, ActionQuery } from '~/types';
+import { withCodeEnvironmentReference } from './codeEnvironment';
 import { filterExistingSkillIds } from './skill';
 import logger from '~/config/winston';
 
@@ -92,14 +93,19 @@ function createEdgeCleanupPipeline(agentIds: string[]): PipelineStage[] {
   ];
 }
 
-/** Removes deleted agent references from every active graph that contains them. */
-async function removeAgentIdsFromEdges(Agent: Model<IAgent>, agentIds: string[]): Promise<void> {
+/** Removes deleted agent references from active graphs in the requested tenant. */
+async function removeAgentIdsFromEdges(
+  Agent: Model<IAgent>,
+  agentIds: string[],
+  tenantId?: string,
+): Promise<void> {
   if (agentIds.length === 0) {
     return;
   }
 
   await Agent.updateMany(
     {
+      ...(tenantId !== undefined ? { tenantId } : {}),
       $or: [{ 'edges.from': { $in: agentIds } }, { 'edges.to': { $in: agentIds } }],
     },
     createEdgeCleanupPipeline(agentIds),
@@ -110,10 +116,7 @@ export interface AgentDeps {
   /** Removes all ACL permissions for a resource. Injected from PermissionService. */
   removeAllPermissions: (params: { resourceType: string; resourceId: unknown }) => Promise<void>;
   /** Gets actions. Created by createActionMethods. */
-  getActions: (
-    searchParams: FilterQuery<unknown>,
-    includeSensitive?: boolean,
-  ) => Promise<unknown[]>;
+  getActions: (query: ActionQuery, includeSensitive?: boolean) => Promise<unknown[]>;
   /** Returns resource IDs solely owned by the given user. From createAclEntryMethods. */
   getSoleOwnedResourceIds: (
     userObjectId: Types.ObjectId,
@@ -203,6 +206,20 @@ function resolveDocumentPath(source: Record<string, unknown>, path: string): unk
   return current;
 }
 
+/** Removes a dotted operator path from an in-memory version projection. */
+function deleteDocumentPath(source: Record<string, unknown>, path: string): void {
+  const segments = path.split('.');
+  const leaf = segments.pop();
+  if (leaf == null) return;
+  let current: Record<string, unknown> = source;
+  for (const segment of segments) {
+    const next = current[segment];
+    if (typeof next !== 'object' || next === null || next instanceof Map) return;
+    current = next as Record<string, unknown>;
+  }
+  delete current[leaf];
+}
+
 /** The values an `$addToSet` specification would add, flattening the `$each` form. */
 function addToSetCandidates(spec: unknown): unknown[] {
   if (
@@ -228,9 +245,16 @@ function operatorsMutateDocument(
   $push: unknown,
   $pull: unknown,
   $addToSet: unknown,
+  $unset: unknown,
 ): boolean {
   if (hasOperatorKeys($push) || hasOperatorKeys($pull)) {
     return true;
+  }
+
+  if (hasOperatorKeys($unset)) {
+    for (const path of Object.keys($unset as Record<string, unknown>)) {
+      if (resolveDocumentPath(currentObject, path) !== undefined) return true;
+    }
   }
 
   if (!hasOperatorKeys($addToSet)) {
@@ -280,13 +304,24 @@ function isDuplicateVersion(
     'actionsHash',
   ];
 
-  const { $push: _$push, $pull: _$pull, $addToSet: _$addToSet, ...directUpdates } = updateData;
+  const {
+    $push: _$push,
+    $pull: _$pull,
+    $addToSet: _$addToSet,
+    $unset,
+    ...directUpdates
+  } = updateData;
 
-  if (Object.keys(directUpdates).length === 0 && !actionsHash) {
+  if (Object.keys(directUpdates).length === 0 && !hasOperatorKeys($unset) && !actionsHash) {
     return null;
   }
 
   const wouldBeVersion = { ...currentData, ...directUpdates } as Record<string, unknown>;
+  if (hasOperatorKeys($unset)) {
+    for (const path of Object.keys($unset as Record<string, unknown>)) {
+      deleteDocumentPath(wouldBeVersion, path);
+    }
+  }
   const lastVersion = versions[versions.length - 1] as Record<string, unknown>;
 
   if (actionsHash && lastVersion.actionsHash !== actionsHash) {
@@ -448,7 +483,10 @@ export function createAgentMethods(
   getAgentWithVersionCount: (
     searchParameter: FilterQuery<IAgent>,
   ) => Promise<(IAgent & { version: number }) | null>;
-  getAgents: (searchParameter: FilterQuery<IAgent>) => Promise<IAgent[]>;
+  getAgents: (
+    searchParameter: FilterQuery<IAgent>,
+    select?: string | Record<string, number>,
+  ) => Promise<IAgent[]>;
   createAgent: (agentData: Record<string, unknown>) => Promise<IAgent>;
   getAgentIdsByMCPServerName: (serverName: string) => Promise<Types.ObjectId[]>;
   getAgentsWithMCPServerNames: () => Promise<Array<Pick<IAgent, '_id' | 'mcpServerNames'>>>;
@@ -499,6 +537,22 @@ export function createAgentMethods(
     has_more: boolean;
     after: string | null;
   }>;
+  getAgentManagementListByAccess: ({
+    accessibleIds,
+    tenantId,
+    limit,
+    after,
+  }: {
+    /** `null` means the caller already passed the unrestricted management-capability check. */
+    accessibleIds: Types.ObjectId[] | null;
+    tenantId: string;
+    limit: number;
+    after?: string | null;
+  }) => Promise<{
+    data: Array<IAgent & { version: number; createdAt: Date; updatedAt: Date }>;
+    has_more: boolean;
+    after: string | null;
+  }>;
   removeAgentResourceFiles: ({
     agent_id,
     files,
@@ -515,6 +569,34 @@ export function createAgentMethods(
   }) => Promise<{ matchedCount: number; modifiedCount: number }>;
 } {
   const { removeAllPermissions, getActions, getSoleOwnedResourceIds, isExternalSkillId } = deps;
+
+  async function restoreAgentAfterReferenceLoss(
+    Agent: Model<IAgent>,
+    agentAfterWrite: IAgent | null,
+    originalAgent: IAgent,
+    lostEnvironmentId: string,
+  ): Promise<void> {
+    if (agentAfterWrite == null) return;
+    const { updatedAt } = agentAfterWrite as IAgent & { updatedAt: Date };
+    const restored = await Agent.replaceOne(
+      {
+        _id: agentAfterWrite._id,
+        code_environment_id: lostEnvironmentId,
+        updatedAt,
+      },
+      originalAgent,
+      { timestamps: false },
+    );
+    if (restored.matchedCount === 0) {
+      /** A concurrent writer may have changed the document after the guarded
+       * write. Never erase that writer, but still remove the lost reference if
+       * it remains active. */
+      await Agent.updateOne(
+        { _id: agentAfterWrite._id, code_environment_id: lostEnvironmentId },
+        { $unset: { code_environment_id: 1 } },
+      );
+    }
+  }
 
   /**
    * Create an agent with the provided data.
@@ -553,7 +635,15 @@ export function createAgentMethods(
         extractMCPServerNames(agentData.tools as string[] | undefined),
     };
 
-    return (await Agent.create(initialAgentData)).toObject() as IAgent;
+    return await withCodeEnvironmentReference(
+      mongoose,
+      typeof agentData.code_environment_id === 'string' ? agentData.code_environment_id : undefined,
+      async () => (await Agent.create(initialAgentData)).toObject() as IAgent,
+      undefined,
+      async (createdAgent) => {
+        await Agent.deleteOne({ _id: createdAgent._id });
+      },
+    );
   }
 
   /**
@@ -604,9 +694,12 @@ export function createAgentMethods(
   /**
    * Get multiple agent documents based on the provided search parameters.
    */
-  async function getAgents(searchParameter: FilterQuery<IAgent>): Promise<IAgent[]> {
+  async function getAgents(
+    searchParameter: FilterQuery<IAgent>,
+    select?: string | Record<string, number>,
+  ): Promise<IAgent[]> {
     const Agent = mongoose.models.Agent as Model<IAgent>;
-    return await Agent.find(searchParameter).lean<IAgent[]>();
+    return await Agent.find(searchParameter, select).lean<IAgent[]>();
   }
 
   /** Returns the ids of every agent referencing `serverName`, the candidate set
@@ -653,10 +746,11 @@ export function createAgentMethods(
     let suppressedVersionEntry = false;
 
     const currentAgent = await Agent.findOne(searchParameter);
+    const currentRevision = (currentAgent as (IAgent & { updatedAt: Date }) | null)?.updatedAt;
     if (currentAgent) {
       const currentObject = currentAgent.toObject() as unknown as Record<string, unknown>;
       const { __v, _id, id: __id, versions, author: _author, ...versionData } = currentObject;
-      const { $push, $pull, $addToSet, ...directUpdates } = updateData;
+      const { $push, $pull, $addToSet, $unset, ...directUpdates } = updateData;
 
       /** Self-heal: drop allowlist ids whose skill no longer exists in the
        *  database or the external registry.
@@ -711,7 +805,7 @@ export function createAgentMethods(
 
         if (actionIds.length > 0) {
           try {
-            const actions = await getActions({ action_id: { $in: actionIds } }, true);
+            const actions = await getActions({ actionId: actionIds }, true);
 
             actionsHash = await generateActionMetadataHash(
               currentAgent.actions,
@@ -725,7 +819,12 @@ export function createAgentMethods(
 
       const shouldCreateVersion =
         !skipVersioning &&
-        (forceVersion || Object.keys(directUpdates).length > 0 || $push || $pull || $addToSet);
+        (forceVersion ||
+          Object.keys(directUpdates).length > 0 ||
+          $push ||
+          $pull ||
+          $addToSet ||
+          $unset);
 
       if (shouldCreateVersion) {
         const duplicateVersion = isDuplicateVersion(
@@ -746,6 +845,7 @@ export function createAgentMethods(
           $push,
           $pull,
           $addToSet,
+          $unset,
         );
         if (duplicateVersion && !forceVersion && !mutatesOutsideSnapshot) {
           suppressedVersionEntry = true;
@@ -759,6 +859,7 @@ export function createAgentMethods(
           delete updateData.$addToSet;
           delete updateData.$push;
           delete updateData.$pull;
+          delete updateData.$unset;
         }
       }
 
@@ -767,6 +868,11 @@ export function createAgentMethods(
         ...directUpdates,
         updatedAt: new Date(),
       };
+      if (hasOperatorKeys($unset)) {
+        for (const path of Object.keys($unset as Record<string, unknown>)) {
+          deleteDocumentPath(versionEntry, path);
+        }
+      }
 
       if (actionsHash) {
         versionEntry.actionsHash = actionsHash;
@@ -784,11 +890,40 @@ export function createAgentMethods(
       }
     }
 
-    const updatedAgent = (await Agent.findOneAndUpdate(
-      searchParameter,
-      updateData,
-      mongoOptions,
-    ).lean()) as IAgent | null;
+    const directEnvironmentId = updateData.code_environment_id;
+    const setEnvironmentId =
+      typeof updateData.$set === 'object' && updateData.$set != null
+        ? (updateData.$set as { code_environment_id?: unknown }).code_environment_id
+        : undefined;
+    let nextEnvironmentId: string | undefined;
+    if (typeof directEnvironmentId === 'string') {
+      nextEnvironmentId = directEnvironmentId;
+    } else if (typeof setEnvironmentId === 'string') {
+      nextEnvironmentId = setEnvironmentId;
+    }
+    const updatedAgent = await withCodeEnvironmentReference(
+      mongoose,
+      nextEnvironmentId,
+      async () =>
+        (await Agent.findOneAndUpdate(
+          currentAgent == null || nextEnvironmentId == null
+            ? searchParameter
+            : { ...searchParameter, _id: currentAgent._id, updatedAt: currentRevision },
+          updateData,
+          mongoOptions,
+        ).lean()) as IAgent | null,
+      undefined,
+      async (agentAfterUpdate) => {
+        if (agentAfterUpdate == null || nextEnvironmentId == null) return;
+        if (currentAgent == null) return;
+        await restoreAgentAfterReferenceLoss(
+          Agent,
+          agentAfterUpdate,
+          currentAgent.toObject() as IAgent,
+          nextEnvironmentId,
+        );
+      },
+    );
 
     /** `version` is a response-only field holding the count of `versions`. It is reported
      *  here so a suppressed entry keeps the shape callers saw before the write was fixed.
@@ -936,6 +1071,7 @@ export function createAgentMethods(
     const User = mongoose.models.User as Model<unknown>;
     const agent = await Agent.findOneAndDelete(searchParameter);
     if (agent) {
+      const deletedAgent = agent as unknown as { id: string; tenantId?: string };
       await Promise.all([
         removeAllPermissions({
           resourceType: ResourceType.AGENT,
@@ -947,14 +1083,17 @@ export function createAgentMethods(
         }),
       ]);
       try {
-        await removeAgentIdsFromEdges(Agent, [(agent as unknown as { id: string }).id]);
+        await removeAgentIdsFromEdges(Agent, [deletedAgent.id], deletedAgent.tenantId);
       } catch (error) {
         logger.error('[deleteAgent] Error removing agent from handoff edges', error);
       }
       try {
         await User.updateMany(
-          { 'favorites.agentId': (agent as unknown as { id: string }).id },
-          { $pull: { favorites: { agentId: (agent as unknown as { id: string }).id } } },
+          {
+            ...(deletedAgent.tenantId !== undefined ? { tenantId: deletedAgent.tenantId } : {}),
+            'favorites.agentId': deletedAgent.id,
+          },
+          { $pull: { favorites: { agentId: deletedAgent.id } } },
         );
       } catch (error) {
         logger.error('[deleteAgent] Error removing agent from user favorites', error);
@@ -1119,6 +1258,8 @@ export function createAgentMethods(
     if (includeSkillConfig) {
       projection.skills = 1;
       projection.skills_enabled = 1;
+      projection.skill_authoring_enabled = 1;
+      projection.skills_scope = 1;
     }
 
     let query = Agent.find(baseQuery, projection).sort({ updatedAt: -1, _id: 1 });
@@ -1161,6 +1302,72 @@ export function createAgentMethods(
   }
 
   /**
+   * Returns the full Agent configuration required by the management response projector.
+   * Unlike the browser list path, this query performs no avatar refresh or persistence write.
+   */
+  async function getAgentManagementListByAccess({
+    accessibleIds,
+    tenantId,
+    limit,
+    after = null,
+  }: {
+    /** `null` means the caller already passed the unrestricted management-capability check. */
+    accessibleIds: Types.ObjectId[] | null;
+    tenantId: string;
+    limit: number;
+    after?: string | null;
+  }): Promise<{
+    data: Array<IAgent & { version: number; createdAt: Date; updatedAt: Date }>;
+    has_more: boolean;
+    after: string | null;
+  }> {
+    const Agent = mongoose.models.Agent as Model<IAgent>;
+    const match: FilterQuery<IAgent> = {
+      tenantId,
+      ...(accessibleIds != null ? { _id: { $in: accessibleIds } } : {}),
+    };
+
+    if (after) {
+      const cursor = JSON.parse(Buffer.from(after, 'base64').toString('utf8')) as {
+        updatedAt: string;
+        _id: string;
+      };
+      match.$or = [
+        { updatedAt: { $lt: new Date(cursor.updatedAt) } },
+        {
+          updatedAt: new Date(cursor.updatedAt),
+          _id: { $gt: new mongoose.Types.ObjectId(cursor._id) },
+        },
+      ];
+    }
+
+    const agents = await Agent.aggregate<
+      IAgent & { version: number; createdAt: Date; updatedAt: Date }
+    >([
+      { $match: match },
+      { $sort: { updatedAt: -1, _id: 1 } },
+      { $limit: limit + 1 },
+      { $addFields: { version: { $size: { $ifNull: ['$versions', []] } } } },
+      { $project: { versions: 0 } },
+    ]);
+
+    const hasMore = agents.length > limit;
+    const data = hasMore ? agents.slice(0, limit) : agents;
+    const lastAgent = data[data.length - 1];
+    const nextCursor =
+      hasMore && lastAgent
+        ? Buffer.from(
+            JSON.stringify({
+              updatedAt: lastAgent.updatedAt.toISOString(),
+              _id: lastAgent._id.toString(),
+            }),
+          ).toString('base64')
+        : null;
+
+    return { data, has_more: hasMore, after: nextCursor };
+  }
+
+  /**
    * Reverts an agent to a specific version in its version history.
    */
   async function revertAgentVersion(
@@ -1178,6 +1385,7 @@ export function createAgentMethods(
     }
 
     const revertToVersion = { ...(agent.versions[versionIndex] as Record<string, unknown>) };
+    const originalRevision = (agent as unknown as IAgent & { updatedAt: Date }).updatedAt;
     delete revertToVersion._id;
     delete revertToVersion.id;
     delete revertToVersion.versions;
@@ -1200,9 +1408,40 @@ export function createAgentMethods(
       }
     }
 
-    const revertedAgent = await Agent.findOneAndUpdate(searchParameter, revertToVersion, {
-      new: true,
-    }).lean<IAgent>();
+    const unsetOnRestore: Record<string, 1> = {};
+    for (const field of ['code_environment_id', 'skills_scope', 'skill_authoring_enabled']) {
+      if (!Object.prototype.hasOwnProperty.call(revertToVersion, field)) {
+        unsetOnRestore[field] = 1;
+      }
+    }
+    const revertUpdate =
+      Object.keys(unsetOnRestore).length > 0
+        ? { $set: revertToVersion, $unset: unsetOnRestore }
+        : { $set: revertToVersion };
+    const revertedAgent = await withCodeEnvironmentReference(
+      mongoose,
+      typeof revertToVersion.code_environment_id === 'string'
+        ? revertToVersion.code_environment_id
+        : undefined,
+      async () =>
+        await Agent.findOneAndUpdate(
+          { ...searchParameter, _id: agent._id, updatedAt: originalRevision },
+          revertUpdate,
+          { new: true },
+        ).lean<IAgent>(),
+      undefined,
+      async (agentAfterRevert) => {
+        if (agentAfterRevert == null || typeof revertToVersion.code_environment_id !== 'string') {
+          return;
+        }
+        await restoreAgentAfterReferenceLoss(
+          Agent,
+          agentAfterRevert,
+          agent.toObject() as IAgent,
+          revertToVersion.code_environment_id,
+        );
+      },
+    );
     if (!revertedAgent) {
       throw new Error('Agent not found');
     }
@@ -1225,13 +1464,17 @@ export function createAgentMethods(
     const Agent = mongoose.models.Agent as Model<IAgent>;
     const User = mongoose.models.User as Model<unknown>;
 
-    const agent = await Agent.findOne({ _id: resourceId }, { id: 1 }).lean();
+    const agent = await Agent.findOne({ _id: resourceId }, { id: 1, tenantId: 1 }).lean();
     if (!agent) {
       return;
     }
 
     await User.updateMany(
-      { _id: { $in: userIds }, 'favorites.agentId': agent.id },
+      {
+        _id: { $in: userIds },
+        ...(agent.tenantId !== undefined ? { tenantId: agent.tenantId } : {}),
+        'favorites.agentId': agent.id,
+      },
       { $pull: { favorites: { agentId: agent.id } } },
     );
   }
@@ -1251,6 +1494,7 @@ export function createAgentMethods(
     countPromotedAgents,
     addAgentResourceFile,
     getListAgentsByAccess,
+    getAgentManagementListByAccess,
     removeAgentResourceFiles,
     generateActionMetadataHash,
     removeAgentFromUserFavorites,
