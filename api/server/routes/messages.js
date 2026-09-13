@@ -22,6 +22,7 @@ const {
   assertStoredMessageMutationAllowed,
   assertChatMutationAllowed,
   assertStoredMessageBranchAllowed,
+  reportLocatorTraversalFailure,
   mergeUserSubmittedPaths,
   mergeUserSubmittedMessageFieldPaths,
   isContentFilterError,
@@ -40,6 +41,8 @@ const db = require('~/models');
 
 const router = express.Router();
 const filterStoredMessageContent = createContentFilter({
+  messageCount: 1,
+  onTraversalFailure: reportLocatorTraversalFailure,
   getFilters: (req) => req.config?.filters,
   getMessageRoles: (req) => [req.body?.role],
   getOpaqueFileInput: (req) => req.body,
@@ -47,6 +50,7 @@ const filterStoredMessageContent = createContentFilter({
   extract: (req) => extractStoredMessageContent(req.body),
 });
 const filterFeedbackContent = createContentFilter({
+  onTraversalFailure: reportLocatorTraversalFailure,
   getFilters: (req) => req.config?.filters,
   extract: (req) => extractFeedbackContent(req.body),
 });
@@ -61,7 +65,14 @@ router.use(requireJwtAuth);
 
 async function rejectSubagentThreadWrite(req, res, conversationId) {
   const blocked = await isSubagentThreadWriteBlocked(
-    { getConvo: db.getConvo, store: subagentThreadTaskStore },
+    {
+      getConvo: async (...args) => {
+        const conversation = await db.getConvo(...args);
+        req.resolvedConversation = conversation;
+        return conversation;
+      },
+      store: subagentThreadTaskStore,
+    },
     {
       userId: req.user.id,
       conversationId,
@@ -344,13 +355,14 @@ router.post('/branch', configMiddleware, async (req, res) => {
         message: newMessage,
         user: req.user,
       },
-      { getFiles: db.getFiles },
+      { getFiles: db.getFiles, onTraversalFailure: reportLocatorTraversalFailure },
     );
 
     const savedMessage = await db.saveMessage(
       {
         userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
+        isTemporary: sourceMessage.isTemporary,
+        expiredAt: sourceMessage.expiredAt,
         interfaceConfig: req?.config?.interfaceConfig,
       },
       newMessage,
@@ -440,7 +452,8 @@ router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
     const savedMessage = await db.saveMessage(
       {
         userId: req?.user?.id,
-        isTemporary: req?.body?.isTemporary,
+        isTemporary: message.isTemporary,
+        expiredAt: message.expiredAt,
         interfaceConfig: req?.config?.interfaceConfig,
       },
       {
@@ -518,7 +531,8 @@ router.post('/:conversationId', storedMessageMutationMiddleware, async (req, res
     delete message.contextMeta;
     const reqCtx = {
       userId: req?.user?.id,
-      isTemporary: req?.body?.isTemporary,
+      isTemporary: req.resolvedConversation?.isTemporary ?? req?.body?.isTemporary,
+      expiredAt: req.resolvedConversation?.expiredAt,
       interfaceConfig: req?.config?.interfaceConfig,
     };
     const savedMessage = await db.saveMessage(

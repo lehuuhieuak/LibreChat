@@ -53,6 +53,7 @@ export const defaultTheme: IThemeRGB = {
   'rgb-surface-destructive': '185 28 28', // #b91c1c (red-700)
   'rgb-surface-destructive-hover': '153 27 27', // #991b1b (red-800)
   'rgb-surface-chat': '255 255 255', // #fff (white)
+  'rgb-surface-code': '247 247 248', // #f7f7f8 (gray-50)
   'rgb-surface-inverted': '23 23 23', // #171717 (gray-850)
   'rgb-surface-inverted-hover': '47 47 47', // #2f2f2f (gray-700)
   'rgb-text-inverted': '255 255 255', // #fff (white)
@@ -88,14 +89,30 @@ export const defaultTheme: IThemeRGB = {
   'rgb-status-neutral': '66 66 66', // #424242 (gray-600)
   'rgb-status-neutral-subtle': '236 236 236', // #ececec (gray-100)
   'rgb-status-neutral-border': '205 205 205', // #cdcdcd (gray-300)
+  /** Verified mark. `blue-600` doubles as `status-info` here, and that is the
+   *  point: one blue for "this is informational/first-party", 5.17:1 under the
+   *  white label and 4.83:1 against the panel. */
+  'rgb-status-verified': '37 99 235', // #2563eb (blue-600)
   'rgb-text-on-status': '255 255 255', // #fff (white)
 
   // Brand colors
   'rgb-brand-purple': '126 34 206', // #7e22ce (purple-700)
 
+  /** Code syntax highlighting, measured against the `surface-code` fill. */
+  'rgb-syntax-text': '33 33 33', // #212121 (gray-800)
+  'rgb-syntax-comment': '89 89 89', // #595959 (gray-500)
+  'rgb-syntax-meta': '66 66 66', // #424242 (gray-600)
+  'rgb-syntax-builtin': '154 103 0', // #9a6700
+  'rgb-syntax-keyword': '5 80 174', // #0550ae
+  'rgb-syntax-string': '10 123 98', // #0a7b62
+  'rgb-syntax-attr': '154 47 106', // #9a2f6a
+  'rgb-syntax-title': '180 35 24', // #b42318
+
   /** Categorical series scale. Steps clear 3:1 against BOTH the popover surface
    *  and the #ececec meter track, with worst adjacent CVD ΔE 12.4 and worst
-   *  adjacent normal-vision ΔE 19.0. Slot order is the CVD-safety mechanism. */
+   *  adjacent normal-vision ΔE 19.0. Slot order is the CVD-safety mechanism:
+   *  indigo(8) sits beside green(7) because blue separates from green under
+   *  protanopia/deuteranopia where red would not. */
   'rgb-series-1': '5 110 189', // #056ebd (cerulean)
   'rgb-series-2': '233 86 13', // #e9560d (orange)
   'rgb-series-3': '0 148 142', // #00948e (aqua)
@@ -103,6 +120,12 @@ export const defaultTheme: IThemeRGB = {
   'rgb-series-5': '216 90 142', // #d85a8e (magenta)
   'rgb-series-6': '126 35 205', // #7e23cd (violet)
   'rgb-series-7': '1 131 1', // #018301 (green)
+  'rgb-series-8': '63 81 181', // #3f51b5 (indigo)
+
+  /** Unchecked switch track. 3.03:1 against the white page and the
+   *  `surface-primary` thumb, 5.91:1 against the checked `surface-inverted`
+   *  track, so the control reads in either state. */
+  'rgb-switch-unchecked': '148 148 148', // #949494
 
   // Presentation
   'rgb-presentation': '255 255 255', // #fff (white)

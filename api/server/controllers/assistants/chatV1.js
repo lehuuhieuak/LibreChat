@@ -6,12 +6,14 @@ const {
   countTokens,
   checkBalance,
   getBalanceConfig,
+  getSafeErrorText,
   getModelMaxTokens,
   getTransactionsConfig,
   ATTACHMENT_ONLY_TEXT,
   isContentFilterError,
   hasActiveFilePolicy,
   preflightAssistantRunContent,
+  reportLocatorTraversalFailure,
   preflightAssistantUserMessageContent,
 } = require('@librechat/api');
 const {
@@ -163,7 +165,7 @@ const chatV1 = async (req, res) => {
     } else if (error?.message?.includes(ViolationTypes.TOKEN_BALANCE)) {
       return sendResponse(req, res, messageData, error.message);
     } else {
-      logger.error('[/assistants/chat/]', error);
+      logger.error(`[/assistants/chat/] ${getSafeErrorText(error)}`);
     }
 
     if (!openai || !thread_id || !run_id) {
@@ -335,6 +337,7 @@ const chatV1 = async (req, res) => {
     let persistedAssistant;
     try {
       persistedAssistant = await preflightAssistantRunContent({
+        onTraversalFailure: reportLocatorTraversalFailure,
         config: req.config,
         openai,
         user: req.user,
@@ -546,6 +549,7 @@ const chatV1 = async (req, res) => {
       await getRequestFileIds();
       try {
         await preflightAssistantUserMessageContent({
+          onTraversalFailure: reportLocatorTraversalFailure,
           config: req.config,
           user: req.user,
           message: userMessage,
@@ -651,6 +655,7 @@ const chatV1 = async (req, res) => {
 
     try {
       await preflightAssistantRunContent({
+        onTraversalFailure: reportLocatorTraversalFailure,
         config: req.config,
         openai,
         user: req.user,

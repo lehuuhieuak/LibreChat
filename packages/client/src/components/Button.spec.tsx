@@ -18,6 +18,20 @@ describe('Button', () => {
     );
   });
 
+  it('offers the composer action row geometry as a size and a shape', () => {
+    render(
+      <Button size="icon-theme" shape="round" aria-label="Scroll to bottom">
+        v
+      </Button>,
+    );
+
+    expect(screen.getByRole('button', { name: 'Scroll to bottom' })).toHaveClass(
+      'size-theme-control',
+      'p-0',
+      'rounded-theme-control-round',
+    );
+  });
+
   it('renders the header-action toggle from semantic tokens', () => {
     render(<Button variant="header-action">Toggle</Button>);
 
@@ -101,5 +115,24 @@ describe('Button', () => {
     expect(sectionAction).toContain('rounded-md');
     expect(sectionAction).toContain('rounded-lg');
     expect(cn(sectionAction)).not.toContain('rounded-lg');
+  });
+
+  /**
+   * Every other variant is given a size by its call sites, but a section
+   * heading is sized by its own text and all three headers ask for the recipe
+   * alone. The default size recipe is emitted after the variant, so without an
+   * opt out it wins the merge and puts a 40px control in a 32px header row.
+   */
+  it('keeps section headers out of the default size recipe', () => {
+    const header = cn(buttonVariants({ variant: 'section-header' }));
+
+    expect(header).toContain('px-1');
+    expect(header).toContain('h-auto');
+    expect(header).not.toContain('h-10');
+    expect(header).not.toContain('px-4');
+  });
+
+  it('still takes a size when a caller asks for one', () => {
+    expect(cn(buttonVariants({ variant: 'section-header', size: 'sm' }))).toContain('h-9');
   });
 });

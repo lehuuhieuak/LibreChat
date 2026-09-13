@@ -3,6 +3,9 @@ jest.mock('./prewarm', () => ({
 }));
 
 import { Readable } from 'stream';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { Constants } from '@librechat/agents';
 import { logger } from '@librechat/data-schemas';
 import type {
@@ -10,12 +13,18 @@ import type {
   ToolExecuteResult,
   ToolCallRequest,
 } from '@librechat/agents';
-import type { PtcToolCallEvent } from 'librechat-data-provider';
+import type { CodeWorkspaceOperation, PtcToolCallEvent } from 'librechat-data-provider';
 import type { CodeExecutionContext } from './execution';
-import { createToolExecuteHandler, ToolExecuteOptions } from './handlers';
+import {
+  createOwnedToolEndHandler,
+  createToolExecuteHandler,
+  ToolExecuteOptions,
+} from './handlers';
 import { markSandboxReady } from './prewarm';
 import { ContentFilterError } from '../middleware/contentFilter';
 import { WorkspaceToolHttpError } from '../code/workspace';
+import { createAttachedWorkspaceBashTool } from '../code/command';
+import { createCodeApiUploadRegistry } from '~/utils';
 
 function createMockTool(
   name: string,
@@ -101,6 +110,32 @@ function skillsInScope(): unknown[] {
   return [new Types.ObjectId()];
 }
 
+const TEST_ATTACHED_WORKSPACE_OPERATIONS: CodeWorkspaceOperation[] = [
+  'read_file',
+  'search_text',
+  'list_files',
+  'write_file',
+  'preview_edit',
+  'edit_file',
+  'execute_command',
+];
+
+function withTestAttachedWorkspace(
+  context: CodeExecutionContext | undefined,
+): CodeExecutionContext | undefined {
+  if (context?.environmentType !== 'attached' || context.codeWorkspace != null) return context;
+  const environmentId = context.environmentId ?? 'personal-machine';
+  return {
+    ...context,
+    environmentId,
+    codeWorkspace: {
+      environmentId,
+      workspaceId: 'project-a',
+      operations: TEST_ATTACHED_WORKSPACE_OPERATIONS,
+    },
+  };
+}
+
 function protectedToolOutputRequest() {
   return {
     user: { id: 'user-1' },
@@ -123,6 +158,28 @@ function protectedToolOutputRequest() {
     },
   } as never;
 }
+
+describe('createOwnedToolEndHandler', () => {
+  it('forwards the graph-owned step identity to the tool callback', async () => {
+    const callback = jest.fn(async () => undefined);
+    const handler = createOwnedToolEndHandler(callback as never, logger);
+    const graph = {
+      toolCallStepIds: new Map([['call_1', 'step-1']]),
+    } as never;
+
+    await handler.handle(
+      'on_tool_end',
+      { output: { tool_call_id: 'call_1', content: 'ok' } } as never,
+      { agent_id: 'agent-a' },
+      graph,
+    );
+
+    expect(callback).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ agent_id: 'agent-a', stepId: 'step-1' }),
+    );
+  });
+});
 
 describe('createToolExecuteHandler', () => {
   describe('code execution session context passthrough', () => {
@@ -334,11 +391,12 @@ describe('createToolExecuteHandler', () => {
       tool: { name: string; invoke: jest.Mock },
       request: Partial<ToolExecuteBatchRequest>,
       controller: AbortController,
+      options: Partial<ToolExecuteOptions> = {},
     ): Promise<ToolExecuteResult[]> {
       const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
         loadedTools: [tool] as never[],
       }));
-      const handler = createToolExecuteHandler({ loadTools });
+      const handler = createToolExecuteHandler({ loadTools, ...options });
       return new Promise<ToolExecuteResult[]>((resolve, reject) => {
         handler.handle('on_tool_execute', {
           toolCalls: [{ id: 'call-1', name: tool.name, args: {} }] as ToolCallRequest[],
@@ -360,6 +418,195 @@ describe('createToolExecuteHandler', () => {
       expect(tool.invoke.mock.calls[0][1].signal).toBe(controller.signal);
       expect(results).toHaveLength(1);
       expect(results[0].status).toBe('error');
+    });
+
+    it('forwards the effective batch signal into deferred tool loading', async () => {
+      const controller = new AbortController();
+      const tool = {
+        name: 'loaded_tool',
+        invoke: jest.fn(async () => ({ content: 'done' })),
+      };
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+        loadedTools: [tool] as never[],
+      }));
+      const handler = createToolExecuteHandler({ loadTools });
+
+      await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [{ id: 'call-load', name: tool.name, args: {} }],
+          signal: controller.signal,
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
+
+      expect(loadTools).toHaveBeenCalledWith(
+        [tool.name],
+        undefined,
+        undefined,
+        undefined,
+        controller.signal,
+        undefined,
+      );
+    });
+
+    it('uses the host-owned run signal when an SDK event omits its signal', async () => {
+      const controller = new AbortController();
+      const tool = abortingTool();
+
+      const results = await runBatch(
+        tool,
+        { signal: undefined, metadata: { run_id: 'foreground-run' } },
+        controller,
+        {
+          runSignal: controller.signal,
+          foregroundRunId: 'foreground-run',
+        },
+      );
+
+      expect(tool.invoke.mock.calls[0][1].signal).toBe(controller.signal);
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('error');
+    });
+
+    it('closes the real command HTTP connection on foreground host cancellation', async () => {
+      let markStarted!: () => void;
+      let markDisconnected!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const disconnected = new Promise<void>((resolve) => {
+        markDisconnected = resolve;
+      });
+      const server = createServer(async (req, res) => {
+        for await (const _chunk of req) {
+          /* Wait for the full command request. */
+        }
+        res.once('close', () => {
+          if (!res.writableEnded) markDisconnected();
+        });
+        markStarted();
+      });
+      server.listen(0, '127.0.0.1');
+      await once(server, 'listening');
+      const { port } = server.address() as AddressInfo;
+      const tool = createAttachedWorkspaceBashTool({
+        baseUrl: `http://127.0.0.1:${port}/v1`,
+        authHeaders: () => ({}),
+        workspaceId: 'project-a',
+      });
+      const controller = new AbortController();
+      const handler = createToolExecuteHandler({
+        loadTools: async () => ({ loadedTools: [tool] }),
+        runSignal: controller.signal,
+        foregroundRunId: 'foreground-run',
+      });
+      try {
+        const result = new Promise<ToolExecuteResult[]>((resolve, reject) => {
+          handler.handle('on_tool_execute', {
+            toolCalls: [{ id: 'call-http', name: tool.name, args: { command: 'sleep 30' } }],
+            metadata: { run_id: 'foreground-run' },
+            resolve,
+            reject,
+          } as ToolExecuteBatchRequest);
+        });
+        await started;
+        controller.abort();
+        expect((await result)[0].status).toBe('error');
+        await disconnected;
+      } finally {
+        server.closeAllConnections();
+        server.close();
+        await once(server, 'close');
+      }
+    });
+
+    it('composes host cancellation with an SDK event circuit-breaker signal', async () => {
+      const controller = new AbortController();
+      const eventController = new AbortController();
+      const tool = abortingTool();
+
+      const results = await runBatch(
+        tool,
+        { signal: eventController.signal, metadata: { run_id: 'foreground-run' } },
+        controller,
+        {
+          runSignal: controller.signal,
+          foregroundRunId: 'foreground-run',
+        },
+      );
+
+      const invokedSignal = tool.invoke.mock.calls[0][1].signal as AbortSignal;
+      expect(invokedSignal).not.toBe(controller.signal);
+      expect(invokedSignal.aborted).toBe(true);
+      expect(eventController.signal.aborted).toBe(false);
+      expect(results).toHaveLength(1);
+      expect(results[0].status).toBe('error');
+    });
+
+    it('does not bind a detached child run to the foreground host signal', async () => {
+      const foregroundController = new AbortController();
+      const childController = new AbortController();
+      foregroundController.abort();
+      const tool = {
+        name: 'child_tool',
+        invoke: jest.fn(async (_args: unknown, _config: Record<string, unknown>) => ({
+          content: 'done',
+        })),
+      };
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+        loadedTools: [tool] as never[],
+      }));
+      const handler = createToolExecuteHandler({
+        loadTools,
+        runSignal: foregroundController.signal,
+        foregroundRunId: 'foreground-run',
+      });
+
+      const [result] = await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [{ id: 'call-1', name: tool.name, args: {} }] as ToolCallRequest[],
+          metadata: { run_id: 'detached-child-run' },
+          signal: childController.signal,
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
+
+      expect(tool.invoke.mock.calls[0][1].signal).toBe(childController.signal);
+      expect(result.status).toBe('success');
+    });
+
+    it('does not bind a tagged child run when the foreground identity is unavailable', async () => {
+      const foregroundController = new AbortController();
+      const childController = new AbortController();
+      foregroundController.abort();
+      const tool = {
+        name: 'child_tool',
+        invoke: jest.fn(async (_args: unknown, _config: Record<string, unknown>) => ({
+          content: 'done',
+        })),
+      };
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+        loadedTools: [tool] as never[],
+      }));
+      const handler = createToolExecuteHandler({
+        loadTools,
+        runSignal: foregroundController.signal,
+      });
+
+      const [result] = await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [{ id: 'call-1', name: tool.name, args: {} }] as ToolCallRequest[],
+          metadata: { run_id: 'detached-child-run' },
+          signal: childController.signal,
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
+
+      expect(tool.invoke.mock.calls[0][1].signal).toBe(childController.signal);
+      expect(result.status).toBe('success');
     });
 
     it('logs a cancelled tool call as debug rather than a tool error', async () => {
@@ -643,7 +890,14 @@ describe('createToolExecuteHandler', () => {
       );
 
       expect(loadTools).toHaveBeenCalledTimes(1);
-      expect(loadTools).toHaveBeenCalledWith(['allowed_tool'], undefined, configurable, undefined);
+      expect(loadTools).toHaveBeenCalledWith(
+        ['allowed_tool'],
+        undefined,
+        configurable,
+        undefined,
+        undefined,
+        undefined,
+      );
       expect(JSON.stringify(jest.mocked(loadTools).mock.calls)).not.toContain(protectedName);
       expect(results[0]).toEqual(
         expect.objectContaining({
@@ -1173,6 +1427,8 @@ describe('createToolExecuteHandler', () => {
         undefined,
         undefined,
         callerCapabilityProjection,
+        undefined,
+        undefined,
       );
       expect(capturedConfigs[0].toolDefs).toEqual([
         { name: 'active_programmatic_tool', allowed_callers: ['code_execution'] },
@@ -1433,58 +1689,92 @@ describe('createToolExecuteHandler', () => {
       }
     });
 
-    it('filters thrown foreground errors before result delivery or logging', async () => {
-      const protectedValue = 'PROTECTED-FOREGROUND-ERROR';
-      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
-        loadedTools: [
-          {
-            name: 'throwing_tool',
-            invoke: jest.fn(async () => {
-              throw new Error(protectedValue);
-            }),
-          },
-        ] as never[],
-      }));
-      const errorSpy = jest.spyOn(logger, 'error').mockReturnValue(logger);
-      try {
-        const handler = createToolExecuteHandler({ loadTools });
-        const [result] = await invokeHandlerWithConfig(
-          handler,
-          [{ id: 'call_filtered_throw', name: 'throwing_tool', args: {} }],
-          {
-            req: {
-              config: {
-                filters: {
-                  toolArguments: {
-                    pii: {
-                      fields: ['output'],
-                      starterPatterns: [],
-                      customPatterns: [
-                        {
-                          id: 'protected-output',
-                          label: 'protected output',
-                          regex: 'PROTECTED-[A-Z-]+',
-                        },
-                      ],
+    it.each(['generic', 'workspace', 'workspace-expanded'])(
+      'filters %s foreground errors before result delivery or logging',
+      async (kind) => {
+        const protectedValue = 'PROTECTED-FOREGROUND-ERROR';
+        const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+          loadedTools: [
+            {
+              name: 'throwing_tool',
+              invoke: jest.fn(async () => {
+                if (kind.startsWith('workspace')) {
+                  const body =
+                    kind === 'workspace-expanded'
+                      ? '\u0001'.repeat(2000) + protectedValue + '\u0001'.repeat(2000)
+                      : protectedValue;
+                  throw new WorkspaceToolHttpError('rejected', 503, body);
+                }
+                throw new Error(protectedValue);
+              }),
+            },
+          ] as never[],
+        }));
+        const errorSpy = jest.spyOn(logger, 'error').mockReturnValue(logger);
+        try {
+          const handler = createToolExecuteHandler({ loadTools });
+          const [result] = await invokeHandlerWithConfig(
+            handler,
+            [{ id: 'call_filtered_throw', name: 'throwing_tool', args: {} }],
+            {
+              req: {
+                config: {
+                  filters: {
+                    toolArguments: {
+                      pii: {
+                        fields: ['output'],
+                        starterPatterns: [],
+                        customPatterns: [
+                          {
+                            id: 'protected-output',
+                            label: 'protected output',
+                            regex: 'PROTECTED-[A-Z-]+',
+                          },
+                        ],
+                      },
                     },
                   },
                 },
               },
             },
-          },
-        );
+          );
 
-        expect(result.status).toBe('error');
-        expect(result.errorMessage).toContain('content_filter_block');
-        expect(result.errorMessage).not.toContain(protectedValue);
-        expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(protectedValue);
-        expect(errorSpy).toHaveBeenCalledWith(
-          '[ON_TOOL_EXECUTE] Tool throwing_tool error',
-          expect.objectContaining({ contentFiltered: true }),
-        );
-      } finally {
-        errorSpy.mockRestore();
-      }
+          expect(result.status).toBe('error');
+          expect(result.errorMessage).toContain('content_filter_block');
+          expect(result.errorMessage).not.toContain(protectedValue);
+          expect(JSON.stringify(errorSpy.mock.calls)).not.toContain(protectedValue);
+          expect(errorSpy).toHaveBeenCalledWith(
+            '[ON_TOOL_EXECUTE] Tool throwing_tool error',
+            expect.objectContaining({ contentFiltered: true }),
+          );
+        } finally {
+          errorSpy.mockRestore();
+        }
+      },
+    );
+
+    it('surfaces workspace transport diagnostics thrown by a loaded tool', async () => {
+      const body = '{"code":"ASSIGNMENT_EXPIRED"}';
+      const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
+        loadedTools: [
+          {
+            name: 'workspace_command',
+            invoke: jest.fn(async () => {
+              throw new WorkspaceToolHttpError('rejected', 504, body);
+            }),
+          },
+        ] as never[],
+      }));
+      const errorSpy = jest.spyOn(logger, 'error').mockReturnValue(logger);
+      const [result] = await invokeHandler(createToolExecuteHandler({ loadTools }), [
+        { id: 'call_command_error', name: 'workspace_command', args: {} },
+      ]);
+      expect(result.errorMessage).toContain('upstreamStatus: 504');
+      expect(result.errorMessage).toContain('ASSIGNMENT_EXPIRED');
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[ON_TOOL_EXECUTE] Tool workspace_command error',
+        expect.objectContaining({ upstreamStatus: 504, upstreamBody: body }),
+      );
     });
 
     it('truncates oversized tool errors in the result and log context', async () => {
@@ -1635,12 +1925,20 @@ describe('createToolExecuteHandler', () => {
         configurable: {
           accessibleSkillIds: skillsInScope(),
           codeEnvAvailable: true,
-          req: { user: { id: 'user-1' } },
+          req: {
+            user: { id: 'user-1', tenantId: 'tenant-1' },
+            app: { locals: { codeApiUploadRegistry: createCodeApiUploadRegistry() } },
+            config: {
+              endpoints: {
+                agents: { codeApiUploadConcurrency: 1, codeApiMaxRetryWaitMs: 1_000 },
+              },
+            },
+          },
         },
       }));
-      const getSkillByName: ToolExecuteOptions['getSkillByName'] = jest.fn(async () => ({
-        _id: `${skillName}-id` as unknown as never,
-        name: skillName,
+      const getSkillByName: ToolExecuteOptions['getSkillByName'] = jest.fn(async (name) => ({
+        _id: `${name ?? skillName}-id` as unknown as never,
+        name: name ?? skillName,
         body: 'skill body',
         fileCount: 1,
         version: 1,
@@ -1979,6 +2277,7 @@ describe('createToolExecuteHandler', () => {
     });
 
     it('omits the unavailability note when file priming succeeds', async () => {
+      const controller = new AbortController();
       const batchUploadCodeEnvFiles = jest.fn(async () => ({
         storage_session_id: 'session-ok',
         files: [
@@ -1988,14 +2287,24 @@ describe('createToolExecuteHandler', () => {
       }));
       const handler = createPrimingSkillHandler('note-ok-skill', batchUploadCodeEnvFiles);
 
-      const [result] = await invokeHandler(handler, [
-        {
-          id: 'call_prime_ok',
-          name: Constants.SKILL_TOOL,
-          args: { skillName: 'note-ok-skill' },
-        },
-      ]);
+      const [result] = await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [
+            {
+              id: 'call_prime_ok',
+              name: Constants.SKILL_TOOL,
+              args: { skillName: 'note-ok-skill' },
+            },
+          ],
+          signal: controller.signal,
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
 
+      expect(batchUploadCodeEnvFiles).toHaveBeenCalledWith(
+        expect.objectContaining({ signal: controller.signal }),
+      );
       expect(result.status).toBe('success');
       expect(result.content).not.toContain('could not be loaded');
       expect(result.artifact).toEqual(
@@ -2010,6 +2319,74 @@ describe('createToolExecuteHandler', () => {
           ],
         }),
       );
+    });
+
+    it('shares one retry-wait budget across skill calls in a tool batch', async () => {
+      const attempts = new Map<string, number>();
+      const batchUploadCodeEnvFiles = jest.fn(async ({ id }: { id: string }) => {
+        const attempt = (attempts.get(id) ?? 0) + 1;
+        attempts.set(id, attempt);
+        if (attempt === 1) {
+          const error = Object.assign(new Error('Request failed with status code 429'), {
+            isAxiosError: true,
+            response: { status: 429, headers: { 'retry-after': '0' } },
+          });
+          throw error;
+        }
+        const name = id.replace(/-id$/, '');
+        return {
+          storage_session_id: `session-${name}`,
+          files: [{ fileId: `file-${name}`, filename: `skills/${name}/references/style.md` }],
+        };
+      });
+      const handler = createPrimingSkillHandler('fallback-skill', batchUploadCodeEnvFiles);
+
+      const results = await invokeHandler(handler, [
+        {
+          id: 'call_first_skill',
+          name: Constants.SKILL_TOOL,
+          args: { skillName: 'first-skill' },
+        },
+        {
+          id: 'call_second_skill',
+          name: Constants.SKILL_TOOL,
+          args: { skillName: 'second-skill' },
+        },
+      ]);
+
+      expect(batchUploadCodeEnvFiles).toHaveBeenCalledTimes(3);
+      expect(results.filter((result) => result.artifact != null)).toHaveLength(1);
+    });
+
+    it('returns cancellation instead of a successful skill when upload recovery is aborted', async () => {
+      const controller = new AbortController();
+      const batchUploadCodeEnvFiles = jest.fn(
+        ({ signal }: { signal?: AbortSignal }) =>
+          new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+          }),
+      );
+      const handler = createPrimingSkillHandler('cancelled-skill', batchUploadCodeEnvFiles);
+      const resultPromise = new Promise<ToolExecuteResult[]>((resolve, reject) => {
+        handler.handle('on_tool_execute', {
+          toolCalls: [
+            {
+              id: 'call_cancelled_skill',
+              name: Constants.SKILL_TOOL,
+              args: { skillName: 'cancelled-skill' },
+            },
+          ],
+          signal: controller.signal,
+          resolve,
+          reject,
+        } as ToolExecuteBatchRequest);
+      });
+      setTimeout(() => controller.abort(), 10);
+
+      const [result] = await resultPromise;
+
+      expect(result.status).toBe('error');
+      expect(result.content).not.toContain('Skill "cancelled-skill" loaded');
     });
 
     it("read_file pins lookup to the primed skill's _id when manually invoked this turn (no shadowing on collision)", async () => {
@@ -3860,6 +4237,9 @@ describe('createToolExecuteHandler', () => {
       params: Partial<ToolExecuteOptions>,
       configurable?: Record<string, unknown>,
     ) {
+      const codeExecutionContext = withTestAttachedWorkspace(
+        configurable?.codeExecutionContext as CodeExecutionContext | undefined,
+      );
       const loadTools: ToolExecuteOptions['loadTools'] = jest.fn(async () => ({
         loadedTools: [],
         configurable: {
@@ -3869,6 +4249,7 @@ describe('createToolExecuteHandler', () => {
           skillAuthoringAvailable: false,
           fileAuthoringToolNames: new Set(['create_file', 'edit_file']),
           ...(configurable ?? {}),
+          ...(codeExecutionContext == null ? {} : { codeExecutionContext }),
         },
       }));
       return createToolExecuteHandler({
@@ -3921,6 +4302,45 @@ describe('createToolExecuteHandler', () => {
         files: [{ id: 'f1', name: 'input.csv', session_id: 'sess-prev' }],
         req,
       });
+    });
+
+    it('does not report a sandbox write as durable when artifact delivery failed', async () => {
+      const readSandboxFile = jest.fn(async () => {
+        throw new Error('cat: /mnt/data/new.txt: No such file or directory');
+      });
+      const writeSandboxFile = jest.fn(async () => ({
+        stdout: 'WROTE 11 bytes to /mnt/data/new.txt\n',
+        session_id: 'sess-new',
+        files: [],
+        artifact_delivery: {
+          code: 'artifact_delivery_failed' as const,
+          status: 'failed' as const,
+          attempted: 1,
+          delivered: 0,
+          failed: 1,
+        },
+      }));
+      const handler = makeSandboxAuthoringHandler({
+        readSandboxFile,
+        writeSandboxFile,
+      });
+
+      const [result] = await invokeHandler(handler, [
+        {
+          id: 'call_create_sandbox_delivery_failure',
+          name: 'create_file',
+          args: {
+            path: '/mnt/data/new.txt',
+            content: 'hello world',
+          },
+        } as unknown as ToolCallRequest,
+      ]);
+
+      expect(result.status).toBe('error');
+      expect(result.errorMessage).toContain('could not be persisted');
+      expect(result.errorMessage).toContain('do not retry automatically');
+      expect(result.errorMessage).not.toContain('storage');
+      expect(result.artifact).toBeUndefined();
     });
 
     it('carries whole file refs into the next authoring call on the same path', async () => {
@@ -4111,7 +4531,7 @@ describe('createToolExecuteHandler', () => {
         file_path: 'src/new.ts',
         content: 'export const ok = 1;',
         overwrite: false,
-        workspace_id: 'primary',
+        workspace_id: 'project-a',
         codeApiBaseUrl: 'https://code.example.com',
         executionProfile: 'stateful',
         bridgeWorkerId: 'user-worker',
@@ -4231,7 +4651,7 @@ describe('createToolExecuteHandler', () => {
           { oldText: 'draft', newText: 'ready' },
           { oldText: 'false', newText: 'true' },
         ],
-        workspace_id: 'primary',
+        workspace_id: 'project-a',
         codeApiBaseUrl: 'https://code.example.com',
         executionProfile: 'stateful',
         bridgeWorkerId: 'user-worker',
@@ -5011,6 +5431,7 @@ describe('createToolExecuteHandler', () => {
       listWorkspaceFiles?: ToolExecuteOptions['listWorkspaceFiles'];
       readSandboxFile?: ToolExecuteOptions['readSandboxFile'];
       readSandboxImage?: ToolExecuteOptions['readSandboxImage'];
+      runSignal?: AbortSignal;
       getSkillByName?: ToolExecuteOptions['getSkillByName'];
       getAuthorSkillByName?: ToolExecuteOptions['getAuthorSkillByName'];
     }) {
@@ -5023,11 +5444,12 @@ describe('createToolExecuteHandler', () => {
           activeSkillNames: params.activeSkillNames,
           skillPrimedIdsByName: params.skillPrimedIdsByName,
           skillAuthoringAvailable: params.skillAuthoringAvailable === true,
-          codeExecutionContext: params.codeExecutionContext,
+          codeExecutionContext: withTestAttachedWorkspace(params.codeExecutionContext),
         },
       }));
       return createToolExecuteHandler({
         loadTools,
+        runSignal: params.runSignal,
         getSkillByName: params.getSkillByName,
         getAuthorSkillByName: params.getAuthorSkillByName,
         readWorkspaceFile: params.readWorkspaceFile,
@@ -5075,7 +5497,7 @@ describe('createToolExecuteHandler', () => {
 
       expect(readWorkspaceFile).toHaveBeenCalledWith({
         file_path: 'src/app.ts',
-        workspace_id: 'primary',
+        workspace_id: 'project-a',
         start_line: 1,
         max_lines: 200,
         codeApiBaseUrl: 'https://code.example.com/v1',
@@ -5381,7 +5803,7 @@ describe('createToolExecuteHandler', () => {
 
       expect(searchWorkspace).toHaveBeenCalledWith({
         query: 'needle',
-        workspace_id: 'primary',
+        workspace_id: 'project-a',
         path: 'src',
         max_results: 20,
         codeApiBaseUrl: 'https://code.example.com/v1',
@@ -5459,6 +5881,42 @@ describe('createToolExecuteHandler', () => {
       expect(searchWorkspace).not.toHaveBeenCalled();
     });
 
+    it.each([400, 409, 503, 504])(
+      'surfaces workspace HTTP %i in logs and model results',
+      async (status) => {
+        const body = '{"code":"WORKER_BUSY","error":"Worker is busy"}';
+        const errorSpy = jest.spyOn(logger, 'error').mockReturnValue(logger);
+        const handler = makeReadFileHandler({
+          codeEnvAvailable: true,
+          codeExecutionContext: {
+            baseUrl: 'https://code.example.com',
+            codeSessionKey: 'attached',
+            executionProfile: 'stateful',
+            statefulSessions: true,
+            environmentType: 'attached',
+          },
+          listWorkspaceFiles: jest.fn(async () => {
+            throw new WorkspaceToolHttpError('rejected', status, body);
+          }),
+        });
+        const [result] = await invokeHandler(handler, [
+          { id: 'call_workspace_error', name: 'list_workspace_files', args: {} },
+        ]);
+        expect(result.status).toBe('error');
+        expect(result.errorMessage).toContain(`upstreamStatus: ${status}`);
+        expect(result.errorMessage).toContain('WORKER_BUSY');
+        expect(errorSpy).toHaveBeenCalledWith(
+          '[ON_TOOL_EXECUTE] Tool list_workspace_files error',
+          expect.objectContaining({
+            name: 'WorkspaceToolHttpError',
+            upstreamStatus: status,
+            upstreamBody: body,
+            upstreamBodyTruncated: false,
+          }),
+        );
+      },
+    );
+
     it('lists files through the selected attached worker and forwards cancellation', async () => {
       const controller = new AbortController();
       const listWorkspaceFiles = jest.fn(async () => ({
@@ -5497,7 +5955,7 @@ describe('createToolExecuteHandler', () => {
       });
 
       expect(listWorkspaceFiles).toHaveBeenCalledWith({
-        workspace_id: 'primary',
+        workspace_id: 'project-a',
         path: 'src',
         after_path: 'src/app.ts',
         max_results: 20,
@@ -6627,6 +7085,7 @@ describe('createToolExecuteHandler', () => {
        * bytes, which was the matplotlib-shape mojibake regression.
        */
       it('returns a sandbox image as an image_url artifact the model can see', async () => {
+        const controller = new AbortController();
         const readSandboxFile = jest.fn();
         const readSandboxImage = jest.fn(async () => ({ base64: PNG_B64, bytes: pngBytes }));
         const handler = makeReadFileHandler({
@@ -6636,14 +7095,21 @@ describe('createToolExecuteHandler', () => {
           readSandboxImage,
         });
 
-        const [result] = await invokeHandler(handler, [
-          {
-            id: 'call_png',
-            name: Constants.READ_FILE,
-            args: { path: '/mnt/data/simple_graph.png' },
-            codeSessionContext: { session_id: 'sess-Z', files: [] },
-          } as unknown as ToolCallRequest,
-        ]);
+        const [result] = await new Promise<ToolExecuteResult[]>((resolve, reject) => {
+          handler.handle('on_tool_execute', {
+            toolCalls: [
+              {
+                id: 'call_png',
+                name: Constants.READ_FILE,
+                args: { path: '/mnt/data/simple_graph.png' },
+                codeSessionContext: { session_id: 'sess-Z', files: [] },
+              } as unknown as ToolCallRequest,
+            ],
+            signal: controller.signal,
+            resolve,
+            reject,
+          } as ToolExecuteBatchRequest);
+        });
 
         expect(readSandboxFile).not.toHaveBeenCalled();
         expect(readSandboxImage).toHaveBeenCalledWith(
@@ -6651,6 +7117,7 @@ describe('createToolExecuteHandler', () => {
             file_path: '/mnt/data/simple_graph.png',
             session_id: 'sess-Z',
             maxBytes: expect.any(Number),
+            signal: controller.signal,
           }),
         );
         expect(result.status).toBe('success');

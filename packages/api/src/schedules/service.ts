@@ -6,6 +6,7 @@ import type { Types } from 'mongoose';
 import type {
   ScheduleEngineDeps,
   ScheduleDeleteResult,
+  ScheduleMCPPreflight,
   ScheduleLimits,
   ScheduleUserContext,
   FireableSchedule,
@@ -13,6 +14,7 @@ import type {
   JobIdentity,
 } from './types';
 import type { SerializableJobData } from '../stream/interfaces/IJobStore';
+import type { AgentCheckpointGeneration } from '../agents/checkpointer';
 import type { BalanceUpdateFields } from '../types/balance';
 import type { GetAppConfigOptions } from '../app/service';
 import {
@@ -22,7 +24,11 @@ import {
   hasResumeHandoffInFlight,
   hasAbortInFlight,
 } from './types';
-import { deleteAgentCheckpoint, captureAgentCheckpointGeneration } from '../agents/checkpointer';
+import {
+  deleteAgentCheckpoint,
+  captureAgentCheckpointGeneration,
+  checkpointStorageConfigs,
+} from '../agents/checkpointer';
 import { fireSchedule, BALANCE_SKIP_DISABLE_THRESHOLD } from './fire';
 import { GenerationJobManager } from '../stream/GenerationJobManager';
 import { isStopConfirmed } from '../stream/interfaces/IJobStore';
@@ -92,6 +98,7 @@ export interface RecordScheduleOutcomeInput {
   jobCreatedAt?: number;
   status: ScheduleRunOutcomeStatus;
   conversationId?: string;
+  checkpointNamespace?: string;
   /** Erase the row's reserved conversationId (pre-start abort: no conversation exists). */
   clearConversationId?: boolean;
   error?: string;
@@ -108,6 +115,7 @@ export type ScheduleResumeClaimResult =
  * directly.
  */
 export interface SchedulesServiceDeps {
+  preflightMCP: ScheduleMCPPreflight;
   methods: ScheduleMethods & {
     getRoleByName: (
       role?: string,
@@ -181,6 +189,7 @@ export interface SchedulesService {
   fireScheduleNow: (
     schedule: FireableSchedule,
     limits: ScheduleLimits,
+    options?: { signal?: AbortSignal },
   ) => Promise<FireResult | null>;
   recordScheduleOutcome: (input: RecordScheduleOutcomeInput) => Promise<boolean>;
   /**
@@ -371,7 +380,13 @@ export function createSchedulesService(
       minIntervalMinutes: config.minIntervalMinutes ?? DEFAULT_SCHEDULE_LIMITS.minIntervalMinutes,
       autoDisableAfterFailures:
         config.autoDisableAfterFailures ?? DEFAULT_SCHEDULE_LIMITS.autoDisableAfterFailures,
+      admissionConcurrency:
+        config.admissionConcurrency ?? DEFAULT_SCHEDULE_LIMITS.admissionConcurrency,
       fireConcurrency: config.fireConcurrency ?? DEFAULT_SCHEDULE_LIMITS.fireConcurrency,
+      mcpPreflightConcurrency:
+        config.mcpPreflightConcurrency ?? DEFAULT_SCHEDULE_LIMITS.mcpPreflightConcurrency,
+      mcpPreflightTimeoutMs:
+        config.mcpPreflightTimeoutMs ?? DEFAULT_SCHEDULE_LIMITS.mcpPreflightTimeoutMs,
       requireProject: config.requireProject === true || projectId != null,
       ...(projectId != null && { projectId }),
     };
@@ -421,6 +436,7 @@ export function createSchedulesService(
   }
 
   const engineDeps: ScheduleEngineDeps = {
+    preflightMCP: deps.preflightMCP,
     methods,
     getLimits,
     // On the BASE deps, not only the engine's per-pass wrapper: fireScheduleNow
@@ -544,6 +560,7 @@ export function createSchedulesService(
       return {
         status: job.status,
         createdAt: job.createdAt,
+        checkpointNamespace: job.checkpointNamespace,
         scheduleId: job.scheduleId,
         scheduledFor: job.scheduledFor,
         createdEventEmitted: job.createdEventEmitted === true,
@@ -750,6 +767,7 @@ export function createSchedulesService(
   async function fireScheduleNow(
     schedule: FireableSchedule,
     limits: ScheduleLimits,
+    options?: { signal?: AbortSignal },
   ): Promise<FireResult | null> {
     // The global stop means STOP: a manual run dispatches the same billed generation as
     // an automatic one, so gating only the engine tick would leave Run Now wide open.
@@ -769,7 +787,10 @@ export function createSchedulesService(
       // Fire the FRESH leased row (post-image with the new claim token), not the
       // snapshot the route read before the lease — an edit that committed in the
       // window in between is reflected, so a stale prompt/agent is never dispatched.
-      return await fireSchedule(engineDeps, leased, limits, new Date(), { manual: true });
+      return await fireSchedule(engineDeps, leased, limits, new Date(), {
+        manual: true,
+        signal: options?.signal,
+      });
     } catch (err) {
       const released =
         claimToken != null
@@ -837,6 +858,7 @@ export function createSchedulesService(
     jobCreatedAt,
     status,
     conversationId,
+    checkpointNamespace,
     clearConversationId,
     error,
   }: RecordScheduleOutcomeInput): Promise<boolean> {
@@ -891,6 +913,9 @@ export function createSchedulesService(
           status,
           clearConversationId,
           conversationId,
+          ...(status === 'requires_action' && checkpointNamespace != null
+            ? { checkpointNamespace }
+            : {}),
           error,
           autoDisableAfterFailures: limits.autoDisableAfterFailures,
           balanceSkipDisableThreshold: BALANCE_SKIP_DISABLE_THRESHOLD,
@@ -1331,6 +1356,15 @@ export function createSchedulesService(
           return undefined;
         })
       : undefined;
+    const stores = hasPausedRun
+      ? await checkpointStorageConfigs(userId, schedule.tenantId, checkpointer).catch((err) => {
+          logger.warn(
+            `[schedules] checkpoint storage lookup failed for delete ${scheduleId}:`,
+            err,
+          );
+          return [checkpointer];
+        })
+      : [];
     let unconfirmed = 0;
     for (const run of active) {
       // UNKNOWN is not ABSENT — the same distinction the quiesce path draws. A lookup
@@ -1351,10 +1385,29 @@ export function createSchedulesService(
       // Capture the paused run's checkpoint ids BEFORE any terminal transition below:
       // the prune afterwards is scoped to exactly this set, so checkpoints a
       // replacement turn writes after this point can never be swept up by it.
-      const checkpointGeneration =
-        run.status === 'requires_action' && run.conversationId
-          ? await captureAgentCheckpointGeneration(run.conversationId, checkpointer)
+      const checkpointNamespace =
+        isThisGeneration || live.job == null
+          ? (live.job?.checkpointNamespace ?? run.checkpointNamespace)
           : undefined;
+      const captured: Array<{
+        storage: TCheckpointerConfig | undefined;
+        generation: AgentCheckpointGeneration;
+      }> = [];
+      if (
+        run.status === 'requires_action' &&
+        run.conversationId &&
+        live.known &&
+        (live.job == null || isThisGeneration)
+      ) {
+        for (const storage of stores) {
+          const generation = await captureAgentCheckpointGeneration(
+            run.conversationId,
+            storage,
+            checkpointNamespace == null ? {} : { checkpointNamespace },
+          );
+          if (generation != null) captured.push({ storage, generation });
+        }
+      }
       // Same abort-in-flight deferral as quiesce: post-abort job state (status `aborted`,
       // or absence once the abort deleted the job) appears before the owner has persisted
       // and settled, so it is not evidence that the generation is done.
@@ -1437,8 +1490,7 @@ export function createSchedulesService(
       if (
         run.status === 'requires_action' &&
         run.conversationId &&
-        checkpointGeneration != null &&
-        checkpointGeneration.checkpointIds.length > 0
+        captured.some(({ generation }) => generation.checkpointIds.length > 0)
       ) {
         const fresh = await engineDeps.getJobStatus(run.conversationId).then(
           (job) => ({ known: true, job }),
@@ -1452,9 +1504,11 @@ export function createSchedulesService(
           });
         const ownsConversation = fresh.known && (fresh.job == null || freshIsThisGeneration);
         if (ownsConversation) {
-          await deleteAgentCheckpoint(run.conversationId, checkpointer, checkpointGeneration).catch(
-            () => undefined,
-          );
+          for (const { storage, generation } of captured) {
+            await deleteAgentCheckpoint(run.conversationId, storage, generation).catch(
+              () => undefined,
+            );
+          }
         }
       }
     }

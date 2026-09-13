@@ -11,6 +11,7 @@ import {
   extractEnvVariable,
   providerEndpointMap,
   normalizeEndpointName,
+  resolveUseResponsesApi,
 } from 'librechat-data-provider';
 import type {
   SummarizationConfig as AgentSummarizationConfig,
@@ -35,6 +36,8 @@ import type {
 } from '@librechat/agents';
 import type {
   Agent,
+  ImageDetail,
+  CodeApprovalMode,
   TAgentsEndpoint,
   AgentModelParameters,
   AgentSubagentsConfig,
@@ -47,13 +50,16 @@ import type { CallbackHandlerMethods } from '@langchain/core/callbacks/base';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { Callbacks } from '@langchain/core/callbacks/manager';
 import type { ModelBoundChatModelCallback } from '~/middleware/modelBoundContent';
+import type { ModelErrorTrackerCallback } from '~/agents/failures/tracker';
 import type { ToolInputValidationError } from '~/agents/toolValidation';
 import type { ResolvedToolApprovalHook } from '~/agents/hitl/hooks';
 import type { TerminalSteerHook } from '~/agents/steering/runtime';
+import type { LangfuseTraceContext } from '~/langfuse/identity';
 import type { ResolvedAlwaysApplySkill } from '~/agents/skills';
 import type { CodeExecutionContext } from '~/agents/execution';
 import type { MCPToolAlias } from '~/tools/classification';
 import type { SubagentUsageEvent } from '~/agents/usage';
+import type { RunFileSession } from './files/session';
 import type { RunFadingTiers } from './fading';
 import type * as t from '~/types';
 import {
@@ -61,6 +67,7 @@ import {
   collectAttachedCodeEnvironmentAgentIds,
   collectAttachedCodeEnvironmentPolicySettings,
   createAttachedCodeEnvironmentPolicyHook,
+  resolveAttachedCodeApprovalMode,
 } from '~/agents/hitl/byom';
 import {
   CHECK_BACKGROUND_TASK_NAME,
@@ -87,6 +94,11 @@ import {
   ASK_USER_QUESTION_TOOL_NAME,
   createAskUserQuestionTool,
 } from '~/agents/hitl/askUserQuestionTool';
+import {
+  createRunFileTools,
+  eventOnlyRunFileTools,
+  isRunFileSharingSupported,
+} from './files/runtime';
 import {
   resolveStreamLimits,
   resolveSubagentMaxTurns,
@@ -406,6 +418,7 @@ type RunAgent = Omit<Agent, 'tools'> & {
   /** Pre-ratio context budget from initializeAgent. */
   baseContextTokens?: number;
   useLegacyContent?: boolean;
+  imageDetail?: ImageDetail;
   toolContextMap?: Record<string, unknown>;
   dynamicToolContextMap?: Record<string, unknown>;
   toolRegistry?: LCToolRegistry;
@@ -942,6 +955,18 @@ function shapeSummarizationConfig(
 }
 
 /**
+ * Below this context budget a summarization cycle cannot make progress: the
+ * summary allocation rounds down to a handful of tokens, the rewritten history
+ * still overflows, and the graph re-triggers summarization on every step until
+ * the recursion limit aborts the run. Dozens of wasted LLM calls surfaced to
+ * the user as an opaque LangGraph error. Falling back to plain pruning instead
+ * either fits the request or fails fast with the actionable `empty_messages`
+ * token-budget breakdown. Matches the floor `initializeAgent` applies when the
+ * user supplies no override.
+ */
+const MIN_SUMMARIZATION_CONTEXT_TOKENS = 1024;
+
+/**
  * Applies `reserveRatio` against the pre-ratio base context budget, falling
  * back to the pre-computed `maxContextTokens` from initializeAgent.
  */
@@ -962,6 +987,8 @@ type CallbackClientOptions = {
   fallbacks?: FallbackConfig[];
 };
 
+type RunModelCallback = ModelBoundChatModelCallback | ModelErrorTrackerCallback;
+
 /**
  * Installs run-stable callbacks on the model client itself. Subagent child
  * graphs intentionally replace invocation callbacks with their own event
@@ -970,7 +997,7 @@ type CallbackClientOptions = {
  */
 function withModelCallbacks<T extends object>(
   options: T,
-  modelCallbacks: readonly ModelBoundChatModelCallback[] | undefined,
+  modelCallbacks: readonly RunModelCallback[] | undefined,
 ): T {
   if (!modelCallbacks?.length) {
     return options;
@@ -1509,6 +1536,27 @@ function buildSubagentConfigs(
  *   their defer_loading overridden to false, preventing redundant re-discovery.
  * @returns {Promise<Run<IState>>} A promise that resolves to a new Run instance.
  */
+/** The caller's trace context over run-derived defaults for the fields it left unset. */
+function resolveRunTraceContext({
+  agents,
+  conversationId,
+  requestBody,
+  traceContext,
+}: {
+  agents: RunAgent[];
+  conversationId?: string;
+  requestBody?: t.RequestBody;
+  traceContext?: LangfuseTraceContext;
+}): LangfuseTraceContext {
+  const primaryAgent = agents[0];
+  return {
+    ...traceContext,
+    conversationId: traceContext?.conversationId ?? conversationId ?? requestBody?.conversationId,
+    provider: traceContext?.provider ?? primaryAgent?.provider,
+    model: traceContext?.model ?? primaryAgent?.model_parameters?.model ?? primaryAgent?.model,
+  };
+}
+
 export async function createRun({
   runId,
   signal,
@@ -1517,14 +1565,17 @@ export async function createRun({
   messages,
   discoveredToolNames,
   requestBody,
+  codeApprovalMode: requestedCodeApprovalMode,
   user,
   tenantId,
   centralTraceExportEnabled,
+  traceContext,
   tokenCounter,
   customHandlers,
   indexTokenCountMap,
   initialSessions,
   summarizationConfig,
+  summarizeOnly = false,
   compactionSemanticIndex,
   initialSummary,
   modelCallbacks,
@@ -1534,6 +1585,7 @@ export async function createRun({
   appConfig,
   subagentUsageSink,
   subagentTasks,
+  runFiles,
   steering,
   activityLabel,
   activityPhase,
@@ -1554,6 +1606,7 @@ export async function createRun({
   streaming?: boolean;
   streamUsage?: boolean;
   requestBody?: t.RequestBody;
+  codeApprovalMode?: CodeApprovalMode;
   user?: IUser;
   tenantId?: string;
   /**
@@ -1561,6 +1614,12 @@ export async function createRun({
    * run. Tenant fanout can still export when tenant routing is available.
    */
   centralTraceExportEnabled?: boolean;
+  /**
+   * Request values the deployment may export as Langfuse trace metadata
+   * (`langfuse.trace.conversationMetadataFields`). The conversation id,
+   * provider, and model default from the run itself.
+   */
+  traceContext?: LangfuseTraceContext;
   /** Message history for extracting previously discovered tools */
   messages?: BaseMessage[];
   /**
@@ -1574,12 +1633,18 @@ export async function createRun({
    */
   discoveredToolNames?: string[];
   summarizationConfig?: SummarizationConfig;
+  /**
+   * Manual compaction: the primary agent summarizes the history outright and
+   * the run ends after the summary without a model call. Applies to the
+   * primary agent only; a chained or delegated agent never runs.
+   */
+  summarizeOnly?: boolean;
   /** Bounded, source-addressed navigation guidance derived with provider messages. */
   compactionSemanticIndex?: CompactionSemanticIndex;
   /** Cross-run summary from formatAgentMessages, forwarded to AgentContext */
   initialSummary?: { text: string; tokenCount: number };
-  /** Model-level guards inherited by root, summary, fallback, and subagent clients. */
-  modelCallbacks?: readonly ModelBoundChatModelCallback[];
+  /** Model callbacks inherited by root, summary, fallback, and subagent clients. */
+  modelCallbacks?: readonly RunModelCallback[];
   /** Calibration ratio from previous run's contextMeta, seeds the pruner EMA */
   calibrationRatio?: number;
   /**
@@ -1612,6 +1677,8 @@ export async function createRun({
   subagentUsageSink?: (event: SubagentUsageEvent) => void;
   /** Host-owned detached-subagent task store and trusted parent-thread scope. */
   subagentTasks?: SubagentTaskConfig;
+  /** Run-scoped file authorization and child context, supplied by the host. */
+  runFiles?: RunFileSession;
   /**
    * The run-scoped steer-drain hook (a `PostToolBatch` callback built via
    * `createSteerDrainHook`). Registered on the run's hook registry independent
@@ -1672,6 +1739,28 @@ export async function createRun({
   RunConfig,
   'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
 >): Promise<Run<IState>> {
+  const resolvedRunId = runId ?? randomUUID();
+  const runFilesActive =
+    runFiles?.activate(
+      resolvedRunId,
+      conversationId ?? requestBody?.conversationId ?? '',
+      agents.map((agent) => agent.id),
+      signal,
+    ) === true;
+  if (
+    appConfig?.endpoints?.agents?.fileSharing?.enabled === true &&
+    agents[0]?.subagents?.enabled === true &&
+    agents[0]?.subagents?.shareFiles === true &&
+    !runFilesActive
+  ) {
+    throw new Error('Run file sharing is not supported by this endpoint: a file host is required.');
+  }
+  if (runFilesActive && !isRunFileSharingSupported()) {
+    throw new Error('Run file sharing requires an agents SDK with subagent context support.');
+  }
+  // Detached child threads resume in a new host request without this run's
+  // input snapshot or publication routing. Shared children stay foreground.
+  const activeSubagentTasks = runFilesActive ? undefined : subagentTasks;
   /**
    * Only extract discovered tools if:
    * 1. We have message history to parse
@@ -1704,6 +1793,27 @@ export async function createRun({
 
   const buildAgentInput = (agent: RunAgent, opts: { isSubagent?: boolean } = {}): AgentInputs => {
     const isSubagent = opts.isSubagent === true;
+    if (runFilesActive) {
+      for (const { memberConfigs } of agent.subagentGraphConfigs ?? []) {
+        const deliveryTargets = new Set(
+          memberConfigs.map((member) =>
+            JSON.stringify([
+              member.provider,
+              member.endpoint ?? member.provider,
+              member.model_parameters?.model ?? member.model,
+              resolveUseResponsesApi(member.model_parameters?.useResponsesApi) === true,
+              // Unset detail inherits the request value, which may differ from explicit auto.
+              member.imageDetail ?? null,
+            ]),
+          ),
+        );
+        if (deliveryTargets.size > 1) {
+          throw new Error(
+            'Shared-file subagent teams must use the same provider, endpoint, model, API mode, and image-detail setting for every member.',
+          );
+        }
+      }
+    }
     const provider =
       (providerEndpointMap[
         agent.provider as keyof typeof providerEndpointMap
@@ -1856,7 +1966,7 @@ export async function createRun({
      * admin-disabled) it is stripped fail-closed with no replacement.
      */
     let tools = agent.tools;
-    let askGraphTools: GenericTool[] | undefined;
+    let graphTools: GenericTool[] | undefined;
     if (agentRequestsAskUserQuestion(agent)) {
       tools = tools?.filter(
         (tool) => (tool as { name?: string } | undefined)?.name !== ASK_USER_QUESTION_TOOL_NAME,
@@ -1867,10 +1977,14 @@ export async function createRun({
         toolRegistry.delete(ASK_USER_QUESTION_TOOL_NAME);
       }
       if (hitlCapable && !isSubagent && !askToolAdminDisabled) {
-        askGraphTools = [
+        graphTools = [
           createAskUserQuestionTool(toolInputValidationErrors) as unknown as GenericTool,
         ];
       }
+    }
+
+    if (runFilesActive) {
+      tools = eventOnlyRunFileTools(tools, toolDefinitions);
     }
 
     const effectiveMaxContextTokens = computeEffectiveMaxContextTokens(
@@ -1878,6 +1992,20 @@ export async function createRun({
       agent.baseContextTokens,
       agent.maxContextTokens,
     );
+
+    const summarizationViable =
+      effectiveMaxContextTokens == null ||
+      effectiveMaxContextTokens >= MIN_SUMMARIZATION_CONTEXT_TOKENS;
+    if (summarization.enabled && !summarizationViable) {
+      logger.warn(
+        '[createRun] Summarization disabled for this run: context budget below viable minimum',
+        {
+          agentId: agent.id,
+          effectiveMaxContextTokens,
+          minimum: MIN_SUMMARIZATION_CONTEXT_TOKENS,
+        },
+      );
+    }
 
     const reasoningKey = getReasoningKey(provider, llmConfig, agent.endpoint, agent.reasoningKey);
     const agentInput: AgentInputs = {
@@ -1896,7 +2024,7 @@ export async function createRun({
       useLegacyContent: agent.useLegacyContent ?? false,
       discoveredTools:
         !isSubagent && discoveredTools.size > 0 ? Array.from(discoveredTools) : undefined,
-      summarizationEnabled: summarization.enabled,
+      summarizationEnabled: summarization.enabled && summarizationViable,
       summarizationConfig: summarization.config,
       ...(!isSubagent && compactionSemanticIndex != null ? { compactionSemanticIndex } : {}),
       initialSummary: isSubagent ? undefined : initialSummary,
@@ -1905,14 +2033,17 @@ export async function createRun({
       initialSessions: buildAgentInitialToolSessions(agent, initialSessions),
       codeSessionKey: agent.codeSessionKey,
     };
-    if (askGraphTools) {
+    if (runFilesActive && runFiles != null && (isSubagent || agent.subagents?.enabled === true)) {
+      graphTools = [...(graphTools ?? []), ...createRunFileTools(runFiles, agent.id, signal)];
+    }
+    if (graphTools) {
       /**
        * Typed structurally — not as `AgentInputs['graphTools']` — because the
        * field ships in `@librechat/agents` > 3.2.57 (agents#289); older SDK
        * versions ignore it at runtime (the tool is then simply absent, never
        * broken). Inline the field in the literal once the dependency is bumped.
        */
-      (agentInput as AgentInputs & { graphTools?: GenericTool[] }).graphTools = askGraphTools;
+      (agentInput as AgentInputs & { graphTools?: GenericTool[] }).graphTools = graphTools;
     }
     return agentInput;
   };
@@ -1920,6 +2051,11 @@ export async function createRun({
   const agentsEndpointConfig = appConfig?.endpoints?.[EModelEndpoint.agents];
   const attachedCodeEnvironmentAgentIds = collectAttachedCodeEnvironmentAgentIds(agents);
   const attachedCodeEnvironmentSettings = collectAttachedCodeEnvironmentPolicySettings(agents);
+  const codeApprovalMode = resolveAttachedCodeApprovalMode(
+    requestedCodeApprovalMode,
+    attachedCodeEnvironmentSettings,
+    agentsEndpointConfig?.toolApproval?.enabled !== false,
+  );
   assertAttachedCodeEnvironmentApprovalSupported({
     hasAttachedCodeEnvironment: attachedCodeEnvironmentAgentIds.size > 0,
     hitlCapable,
@@ -1957,6 +2093,9 @@ export async function createRun({
   }
   for (const agent of agents) {
     const agentInput = buildAgentInput(agent);
+    if (summarizeOnly && agent === agents[0]) {
+      agentInput.summarizeOnly = true;
+    }
     const subagentConfigs = buildSubagentConfigs(
       agent,
       agentInput,
@@ -1966,7 +2105,7 @@ export async function createRun({
       undefined,
       0,
       prebuiltGraphInputs,
-      subagentTasks != null,
+      activeSubagentTasks != null,
       (resolvedAgent) => registerResolvedMCPToolAliases(resolvedAgent),
     );
     if (subagentConfigs.length > 0) {
@@ -1974,11 +2113,14 @@ export async function createRun({
       /** Seed the SDK countdown that bounds nested delegation across isolated child graphs. */
       agentInput.maxSubagentDepth = MAX_SUBAGENT_DEPTH;
     }
-    if (subagentTasks != null) {
+    if (activeSubagentTasks != null) {
       agentInput.toolDefinitions = registerBackgroundTaskTool({
         toolRegistry: agentInput.toolRegistry,
         toolDefinitions: agentInput.toolDefinitions,
-        subagentCompletionWakeups: agentUsesSubagentCompletionWakeups(subagentTasks, agent.id),
+        subagentCompletionWakeups: agentUsesSubagentCompletionWakeups(
+          activeSubagentTasks,
+          agent.id,
+        ),
       }).toolDefinitions;
     }
     agentInputs.push(agentInput);
@@ -2078,6 +2220,7 @@ export async function createRun({
                   hook: createAttachedCodeEnvironmentPolicyHook(
                     attachedCodeEnvironmentAgentIds,
                     attachedCodeEnvironmentSettings,
+                    codeApprovalMode,
                   ),
                 },
               ]
@@ -2087,6 +2230,9 @@ export async function createRun({
     : undefined;
   registerResolvedMCPToolAliases = (resolvedAgent) => {
     if (resolvedAgent.codeExecutionContext?.environmentType === 'attached') {
+      // The admission hook closes over these collections. A lazily resolved agent
+      // therefore receives its own current machine policy before its first tool call;
+      // a mode that machine does not permit safely falls back to ask/deny there.
       attachedCodeEnvironmentAgentIds.add(resolvedAgent.id);
       attachedCodeEnvironmentSettings.set(resolvedAgent.id, {
         configSchema: resolvedAgent.codeExecutionContext.codeEnvironmentConfigSchema,
@@ -2136,13 +2282,13 @@ export async function createRun({
    * this guard is defense in depth).
    */
   let hooks = hitl?.hooks;
-  if (usesSubagentCompletionWakeups(subagentTasks)) {
+  if (usesSubagentCompletionWakeups(activeSubagentTasks)) {
     hooks = hooks ?? new HookRegistry();
     hooks.register('PostToolUse', {
       pattern: String(Constants.SUBAGENT),
       hooks: [
         createSubagentWakeupHandleHook((agentId) =>
-          agentUsesSubagentCompletionWakeups(subagentTasks, agentId),
+          agentUsesSubagentCompletionWakeups(activeSubagentTasks, agentId),
         ),
       ],
       internal: true,
@@ -2222,7 +2368,6 @@ export async function createRun({
   }
 
   const streamLimits = resolveStreamLimits(agentsEndpointConfig);
-  const resolvedRunId = runId ?? randomUUID();
 
   /**
    * Built as a variable (not an inline literal) so the extra
@@ -2242,7 +2387,11 @@ export async function createRun({
     fadingTiers,
     indexTokenCountMap,
     subagentUsageSink,
-    subagentTasks,
+    subagentTasks: activeSubagentTasks,
+    ...(runFilesActive &&
+      runFiles != null && {
+        subagentContext: { prepare: runFiles.prepare, complete: runFiles.complete },
+      }),
     // Exclude side-effecting / large-free-form-arg tools from eager execution.
     // Eager speculatively runs a tool mid-stream; for a big streamed arg (a
     // file body, a bash heredoc, a code block) the accumulated args can diverge
@@ -2304,6 +2453,8 @@ export async function createRun({
       runId: resolvedRunId,
       tenantId: tenantId ?? user?.tenantId,
       centralTraceExportEnabled,
+      user,
+      traceContext: resolveRunTraceContext({ agents, conversationId, requestBody, traceContext }),
     }),
     ...(enableToolOutputReferences && {
       toolOutputReferences: { enabled: true },

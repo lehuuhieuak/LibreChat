@@ -91,6 +91,8 @@ export function composeAgentUpdatePayload(
     stateful_code_sessions,
     stateful_code_environment,
     code_environment_id,
+    code_workspace_id,
+    git_identity,
     recursion_limit,
     category,
     support_contact,
@@ -116,12 +118,32 @@ export function composeAgentUpdatePayload(
   const model = _model ?? '';
   const provider =
     (typeof _provider === 'string' ? _provider : (_provider as StringOption).value) ?? '';
+  /** Pruning reads the complete schema, not the rendered subset, so a role-gated
+   *  parameter is preserved rather than deleted when someone without the
+   *  permission saves an unrelated edit. `webSearchAllowed` narrows only
+   *  `visibleParameters`, which this path does not use. */
   const modelParameterSettings = parameterConfig
-    ? resolveAgentParameterSettings({ ...parameterConfig, model, provider })
+    ? resolveAgentParameterSettings({
+        ...parameterConfig,
+        model,
+        provider,
+        webSearchAllowed: true,
+      })
     : undefined;
   const model_parameters = modelParameterSettings
     ? pruneAgentModelParameters(currentModelParameters, modelParameterSettings)
     : currentModelParameters;
+  let normalizedGitIdentity: AgentUpdateParams['git_identity'];
+  const gitIdentityName = git_identity?.name?.trim() ?? '';
+  const gitIdentityEmail = git_identity?.email?.trim() ?? '';
+  if (gitIdentityName || gitIdentityEmail) {
+    normalizedGitIdentity = {
+      name: gitIdentityName,
+      email: gitIdentityEmail,
+    };
+  } else if (agent_id && git_identity != null) {
+    normalizedGitIdentity = null;
+  }
 
   return {
     payload: {
@@ -140,6 +162,8 @@ export function composeAgentUpdatePayload(
       stateful_code_sessions: normalizedStatefulCodeSessions,
       stateful_code_environment: normalizedStatefulCodeEnvironment,
       code_environment_id: agent_id ? code_environment_id : (code_environment_id ?? undefined),
+      code_workspace_id,
+      git_identity: normalizedGitIdentity,
       recursion_limit,
       category,
       support_contact,
@@ -640,7 +664,13 @@ export default function AgentPanel() {
         });
       }
 
-      create.mutate({ ...basePayload, model, tools, provider });
+      create.mutate({
+        ...basePayload,
+        git_identity: basePayload.git_identity ?? undefined,
+        model,
+        tools,
+        provider,
+      });
     },
     [
       agent_id,

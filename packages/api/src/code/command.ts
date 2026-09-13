@@ -1,12 +1,21 @@
+import { logger } from '@librechat/data-schemas';
 import { tool } from '@librechat/agents/langchain/tools';
-import { BashExecutionToolDefinition, BashToolOutputReferencesGuide } from '@librechat/agents';
+import {
+  BashExecutionToolDefinition,
+  BashToolOutputReferencesGuide,
+  createBashProgrammaticToolCallingTool,
+} from '@librechat/agents';
+import type { AgentGitIdentity, CodeEnvironmentUserConfigSchema } from 'librechat-data-provider';
 import type { DynamicStructuredTool } from '@librechat/agents/langchain/tools';
 import type { LCTool } from '@librechat/agents';
 import type { WorkspaceExecuteCommandResult } from './workspace';
 import type { CodeBridgeFetch } from './bridge';
-import { executeWorkspaceTool } from './workspace';
+import {
+  executeWorkspaceTool,
+  WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+  WORKSPACE_COMMAND_MAX_TIMEOUT_MS,
+} from './workspace';
 
-const DEFAULT_WORKSPACE_ID = 'primary';
 const DEFAULT_OUTPUT_BYTES = 256 * 1024;
 
 export const ATTACHED_WORKSPACE_BASH_DESCRIPTION = `Runs bash commands inside the selected attached environment and returns stdout/stderr. The workspace may be an existing project, a Git repository, or an empty directory; Git is not required.
@@ -30,19 +39,78 @@ const attachedCommandSchema: NonNullable<LCTool['parameters']> = {
     'The bash command or script to execute from the attached workspace root. Files written in the workspace persist between calls, but each call starts a fresh process.',
 };
 
+/** `maxLength` is valid JSON Schema, but the SDK's schema type omits it. */
+interface BoundedWorkingDirectorySchema {
+  type: 'string';
+  maxLength: number;
+  description: string;
+}
+
+const attachedWorkingDirectorySchema: BoundedWorkingDirectorySchema = {
+  type: 'string',
+  maxLength: 4096,
+  description:
+    'Optional working directory relative to the selected workspace root, such as "packages/api". Absolute paths and parent traversal are rejected.',
+};
+
+/** Numeric bounds are valid JSON Schema, but the SDK's schema type omits them. */
+interface BoundedTimeoutSchema {
+  type: 'integer';
+  minimum: number;
+  maximum: number;
+  description: string;
+}
+
+function buildAttachedTimeoutSchema(maxTimeoutMs: number): BoundedTimeoutSchema {
+  const defaultTimeoutMs = Math.min(WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS, maxTimeoutMs);
+  return {
+    type: 'integer',
+    minimum: 1,
+    maximum: maxTimeoutMs,
+    description: `Optional execution timeout in milliseconds, from 1 through ${maxTimeoutMs}. Defaults to ${defaultTimeoutMs}. Waiting for an available worker does not consume this execution budget.`,
+  };
+}
+
+function normalizeAttachedWorkspaceCommandTimeoutMax(maxTimeoutMs: number): number {
+  if (!Number.isSafeInteger(maxTimeoutMs) || maxTimeoutMs < 1) {
+    return WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS;
+  }
+  return Math.min(WORKSPACE_COMMAND_MAX_TIMEOUT_MS, maxTimeoutMs);
+}
+
+export function resolveAttachedWorkspaceCommandTimeoutMax(
+  configSchema?: CodeEnvironmentUserConfigSchema,
+): number {
+  const configured = configSchema?.limits?.maxCommandTimeoutMs;
+  return configured == null
+    ? WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS
+    : normalizeAttachedWorkspaceCommandTimeoutMax(configured);
+}
+
+export function buildAttachedWorkspaceBashSchema(
+  maxTimeoutMs: number = WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
+): NonNullable<LCTool['parameters']> {
+  const effectiveMaxTimeoutMs = normalizeAttachedWorkspaceCommandTimeoutMax(maxTimeoutMs);
+  return {
+    type: 'object',
+    properties: {
+      ...bashSchema.properties,
+      command: attachedCommandSchema,
+      cwd: attachedWorkingDirectorySchema,
+      timeoutMs: buildAttachedTimeoutSchema(effectiveMaxTimeoutMs),
+    },
+    required: ['command'],
+  };
+}
+
 /**
  * This definition is shared with agent metadata. LangChain's JSON Schema
  * dereferencer annotates schemas during validation, so each tool receives an
  * isolated mutable clone instead of mutating this shared definition.
  */
-export const ATTACHED_WORKSPACE_BASH_SCHEMA: NonNullable<LCTool['parameters']> = Object.freeze({
-  type: 'object',
-  properties: {
-    ...bashSchema.properties,
-    command: attachedCommandSchema,
-  },
-  required: ['command'],
-});
+export const ATTACHED_WORKSPACE_BASH_SCHEMA: NonNullable<LCTool['parameters']> = Object.freeze(
+  buildAttachedWorkspaceBashSchema(),
+);
 
 export function buildAttachedWorkspaceBashDescription(enableToolOutputReferences: boolean): string {
   return enableToolOutputReferences
@@ -57,6 +125,41 @@ function quoteShellArgument(value: string): string {
 function commandWithArguments(command: string, args: string[] | undefined): string {
   if (!args?.length) return command;
   return `bash -c ${quoteShellArgument(command)} -- ${args.map(quoteShellArgument).join(' ')}`;
+}
+
+function commandWithGitIdentity(
+  command: string,
+  identity: AgentGitIdentity | null | undefined,
+): string {
+  if (identity == null) return command;
+  const name = identity.name.trim();
+  const email = identity.email.trim();
+  if (
+    name.length === 0 ||
+    name.length > 128 ||
+    email.length === 0 ||
+    email.length > 254 ||
+    /[\0\r\n]/.test(name) ||
+    /[\0\r\n]/.test(email)
+  ) {
+    throw new Error('Invalid agent Git identity');
+  }
+  return `export GIT_AUTHOR_NAME=${quoteShellArgument(name)} GIT_AUTHOR_EMAIL=${quoteShellArgument(email)} GIT_COMMITTER_NAME=${quoteShellArgument(name)} GIT_COMMITTER_EMAIL=${quoteShellArgument(email)}; ${command}`;
+}
+
+/** Apply authorship before the SDK prepares the script and its replay requests. */
+export function createGitIdentityProgrammaticBashTool(
+  options: Parameters<typeof createBashProgrammaticToolCallingTool>[0],
+  identity?: AgentGitIdentity | null,
+): DynamicStructuredTool {
+  const bashTool = createBashProgrammaticToolCallingTool(options);
+  if (identity == null) return bashTool;
+  const execute = bashTool.func.bind(bashTool);
+  bashTool.func = (input, ...args) => {
+    const params = input as { code: string };
+    return execute({ ...params, code: commandWithGitIdentity(params.code, identity) }, ...args);
+  };
+  return bashTool;
 }
 
 function formatCommandResult(result: WorkspaceExecuteCommandResult): string {
@@ -74,42 +177,86 @@ function formatCommandResult(result: WorkspaceExecuteCommandResult): string {
 export function createAttachedWorkspaceBashTool({
   baseUrl,
   authHeaders,
-  workspaceId = DEFAULT_WORKSPACE_ID,
+  workspaceId,
+  gitIdentity,
+  maxTimeoutMs = WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS,
   fetchImpl,
 }: {
   baseUrl: string;
   authHeaders: () => Promise<Record<string, string>> | Record<string, string>;
-  workspaceId?: string;
+  workspaceId: string;
+  gitIdentity?: AgentGitIdentity | null;
+  /** Deployment ceiling already intersected with the protocol hard cap. */
+  maxTimeoutMs?: number;
   fetchImpl?: CodeBridgeFetch;
 }): DynamicStructuredTool {
+  const effectiveMaxTimeoutMs = normalizeAttachedWorkspaceCommandTimeoutMax(maxTimeoutMs);
   return tool(
     async (
-      rawInput: { command: string; args?: string[]; intent?: string },
+      rawInput: {
+        command: string;
+        args?: string[];
+        cwd?: string;
+        timeoutMs?: number;
+        intent?: string;
+      },
       config,
     ): Promise<[string, Record<string, never>]> => {
-      const command = commandWithArguments(rawInput.command, rawInput.args);
-      const result = await executeWorkspaceTool({
-        baseURL: baseUrl,
-        authHeaders: await authHeaders(),
-        request: {
-          protocolVersion: 1,
-          operation: 'execute_command',
-          workspaceId,
-          command,
-          maxOutputBytes: DEFAULT_OUTPUT_BYTES,
-        },
-        signal: config?.signal,
-        fetchImpl,
-      });
-      if (result.operation !== 'execute_command') {
-        throw new Error('Attached workspace returned an unexpected command result.');
+      if (rawInput.timeoutMs != null && rawInput.timeoutMs > effectiveMaxTimeoutMs) {
+        throw new Error(
+          `Command timeout exceeds the deployment limit of ${effectiveMaxTimeoutMs} milliseconds.`,
+        );
       }
-      return [formatCommandResult(result), {}];
+      const command = commandWithGitIdentity(
+        commandWithArguments(rawInput.command, rawInput.args),
+        gitIdentity,
+      );
+      const timeoutMs =
+        rawInput.timeoutMs ?? Math.min(WORKSPACE_COMMAND_DEFAULT_TIMEOUT_MS, effectiveMaxTimeoutMs);
+      const signal = config?.signal;
+      const trace = {
+        runId: config?.metadata?.run_id,
+        workspaceId,
+        signalPresent: signal != null,
+      };
+      const onAbort = (): void => {
+        logger.debug('[BYOMCommand] invocation signal aborted', trace);
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      logger.debug('[BYOMCommand] dispatch', { ...trace, aborted: signal?.aborted === true });
+      try {
+        const result = await executeWorkspaceTool({
+          baseURL: baseUrl,
+          authHeaders: await authHeaders(),
+          request: {
+            protocolVersion: 1,
+            operation: 'execute_command',
+            workspaceId,
+            command,
+            ...(rawInput.cwd ? { cwd: rawInput.cwd } : {}),
+            timeoutMs,
+            maxOutputBytes: DEFAULT_OUTPUT_BYTES,
+          },
+          signal,
+          fetchImpl,
+        });
+        if (result.operation !== 'execute_command') {
+          throw new Error('Attached workspace returned an unexpected command result.');
+        }
+        logger.debug('[BYOMCommand] transport completed', trace);
+        return [formatCommandResult(result), {}];
+      } finally {
+        signal?.removeEventListener('abort', onAbort);
+        logger.debug('[BYOMCommand] transport settled', {
+          ...trace,
+          aborted: signal?.aborted === true,
+        });
+      }
     },
     {
       name: BashExecutionToolDefinition.name,
       description: ATTACHED_WORKSPACE_BASH_DESCRIPTION,
-      schema: structuredClone(ATTACHED_WORKSPACE_BASH_SCHEMA),
+      schema: structuredClone(buildAttachedWorkspaceBashSchema(effectiveMaxTimeoutMs)),
       responseFormat: 'content_and_artifact',
     },
   ) as unknown as DynamicStructuredTool;

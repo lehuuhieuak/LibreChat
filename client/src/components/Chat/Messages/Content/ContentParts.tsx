@@ -165,6 +165,13 @@ const PartWithContext = memo(function PartWithContext({
     [messageId, conversationId, idx, nextType, isSubmitting, isLatestMessage],
   );
 
+  /** Being last WITHIN a body is not being last in the message: activity
+   *  phases split one response into several bodies, so every settled phase has
+   *  a trailing part too. Only the body that holds the message's cursor can
+   *  own a live part — otherwise a phase from minutes ago keeps its reasoning
+   *  shimmering and its peek scrolling while later phases stream. */
+  const holdsCursor = isLastPart && isLast;
+
   return (
     <MessageContext.Provider value={contextValue}>
       <Part
@@ -173,8 +180,8 @@ const PartWithContext = memo(function PartWithContext({
         isSubmitting={isSubmitting}
         key={`part-${messageId}-${getPartKeyIndex(part, idx)}`}
         isCreatedByUser={isCreatedByUser}
-        isLast={isLastPart}
-        showCursor={isLastPart && isLast}
+        isLast={holdsCursor}
+        showCursor={holdsCursor}
         hideAttachments={hideAttachments}
         onToolExpand={onToolExpand}
       />
@@ -206,6 +213,7 @@ type ContentPartsProps = {
   attachments?: TAttachment[];
   searchResults?: { [key: string]: SearchResultData };
   isCreatedByUser: boolean;
+  showThinking: boolean;
   isLast: boolean;
   isSubmitting: boolean;
   isLatestMessage?: boolean;
@@ -269,6 +277,7 @@ const ContentPartsBody = memo(function ContentPartsBody({
   authorHeader,
   conversationId,
   isCreatedByUser,
+  showThinking,
   isLatestMessage,
   createdAt,
   nestedActivityPhase = false,
@@ -661,15 +670,16 @@ const ContentPartsBody = memo(function ContentPartsBody({
       const baseGroupId = getToolGroupId(group.parts, fallbackScope);
       const occurrence =
         resolvedToolGroupOccurrences.get(getToolGroupAnchorIndex(group.parts)) ?? 1;
-      /** Legacy rows lack run-step identity. Their provider ids may repeat,
-       * so preserve the first group's historic stable key and distinguish
-       * later occurrences by sequence rather than a shifting content index. */
       const groupId = occurrence === 1 ? baseGroupId : `${baseGroupId}:occurrence:${occurrence}`;
-      /** Hoisted a level higher when a phase card owns the media row, so the
-       *  same file is not offered by both the block and the card. */
-      const groupAttachments = hideAttachments
-        ? undefined
-        : group.parts.flatMap(({ part }) => attachmentsForPart(part) ?? []);
+      const seenAttachments = new Set<TAttachment>();
+      if (!hideAttachments) {
+        for (const { part } of group.parts) {
+          for (const attachment of attachmentsForPart(part) ?? []) {
+            seenAttachments.add(attachment);
+          }
+        }
+      }
+      const groupAttachments = hideAttachments ? undefined : Array.from(seenAttachments);
       return { ...group, groupId, groupAttachments };
     });
   }, [
@@ -810,6 +820,7 @@ const ContentPartsBody = memo(function ContentPartsBody({
           isSubmitting={isSubmitting}
           isLatestMessage={isLatestMessage}
           nestedActivityPhase
+          showThinking={showThinking}
           withinActivityPhase={withinPhase}
           cursorOwnedElsewhere={cursorOwnedByCard}
           hideAttachments={hoisted}
@@ -1049,13 +1060,15 @@ const ContentPartsBody = memo(function ContentPartsBody({
                *  mark its group as last or nothing holds the streaming
                *  cursor until the next delta. */
               isLast={
-                group.parts.some((p) => p.idx === lastContentIdx) ||
-                group.labelPart?.idx === lastContentIdx
+                isLast &&
+                (group.parts.some((p) => p.idx === lastContentIdx) ||
+                  group.labelPart?.idx === lastContentIdx)
               }
               renderPart={renderGroupedPart}
               lastContentIdx={lastContentIdx}
               groupAttachments={group.groupAttachments}
               initialExpansionState={expansionState.get(groupId)}
+              showThinking={showThinking}
               onExpansionChange={(state) => handleGroupExpansionChange(groupId, state)}
               labelPart={group.labelPart}
               withinActivityPhase={withinActivityPhase}

@@ -1,6 +1,31 @@
 import { EModelEndpoint } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
-import { mergeAccessibleCodeEnvironments } from './config';
+import {
+  isImplicitStatefulCodeRouteAvailable,
+  mergeAccessibleCodeEnvironments,
+  resolveCodeEnvironmentDecisionVersion,
+} from './config';
+
+describe('resolveCodeEnvironmentDecisionVersion', () => {
+  it('advertises the exact supported protocol version', () => {
+    expect(resolveCodeEnvironmentDecisionVersion('1')).toBe(1);
+  });
+
+  it.each([undefined, '0', '2', '1.0', 'true'])(
+    'keeps unsupported configured version %s on the legacy-safe path',
+    (version) => {
+      expect(resolveCodeEnvironmentDecisionVersion(version)).toBeUndefined();
+    },
+  );
+});
+
+describe('isImplicitStatefulCodeRouteAvailable', () => {
+  it('requires both the deployed protocol version and a non-empty managed base URL', () => {
+    expect(isImplicitStatefulCodeRouteAvailable('1', 'https://code.example/v1')).toBe(true);
+    expect(isImplicitStatefulCodeRouteAvailable(undefined, 'https://code.example/v1')).toBe(false);
+    expect(isImplicitStatefulCodeRouteAvailable('1', '  ')).toBe(false);
+  });
+});
 
 describe('mergeAccessibleCodeEnvironments', () => {
   test('adds principal environments without allowing them to shadow deployment entries', async () => {
@@ -54,7 +79,11 @@ describe('mergeAccessibleCodeEnvironments', () => {
 
     expect(result).not.toBe(appConfig);
     expect(result.endpoints?.agents?.statefulCodeSessions?.environments).toEqual([
-      expect.objectContaining({ id: 'deployment-vm', baseURL: 'https://deployment.example' }),
+      expect.objectContaining({
+        id: 'deployment-vm',
+        baseURL: 'https://deployment.example',
+        default: true,
+      }),
       expect.objectContaining({ id: 'personal-vm', baseURL: 'https://deployment.example' }),
     ]);
     expect(appConfig.endpoints?.agents?.statefulCodeSessions?.environments).toHaveLength(1);
@@ -130,6 +159,9 @@ describe('mergeAccessibleCodeEnvironments', () => {
                   permissions: {
                     commandExecution: { allowed: ['ask', 'deny'], default: 'ask' },
                   },
+                  limits: {
+                    maxCommandTimeoutMs: 120_000,
+                  },
                 },
               },
             ],
@@ -167,6 +199,9 @@ describe('mergeAccessibleCodeEnvironments', () => {
       configSchema: {
         permissions: {
           commandExecution: { allowed: ['ask', 'deny'], default: 'ask' },
+        },
+        limits: {
+          maxCommandTimeoutMs: 120_000,
         },
       },
       settings: { permissions: { commandExecution: 'deny' } },
@@ -348,7 +383,16 @@ describe('mergeAccessibleCodeEnvironments', () => {
     ]);
   });
 
-  test('defaults to an executable principal environment after a pairing-only control plane', async () => {
+  test.each([
+    ['preserves the configured stateful deployment', 'https://stateful.example/v1', undefined],
+    ['uses the principal environment without a stateful deployment', undefined, true],
+  ])('%s after a pairing-only control plane', async (_name, statefulURL, expectedDefault) => {
+    const originalStatefulURL = process.env.LIBRECHAT_CODE_BASEURL_STATEFUL;
+    if (statefulURL == null) {
+      delete process.env.LIBRECHAT_CODE_BASEURL_STATEFUL;
+    } else {
+      process.env.LIBRECHAT_CODE_BASEURL_STATEFUL = statefulURL;
+    }
     const pairingOnly = {
       id: 'self-service',
       name: 'Self-service',
@@ -366,32 +410,43 @@ describe('mergeAccessibleCodeEnvironments', () => {
       },
     } as unknown as AppConfig;
 
-    const result = await mergeAccessibleCodeEnvironments({
-      appConfig,
-      deploymentConfig: appConfig,
-      actor: { userId: '68b2f0c498f24c1e78fa0001', role: 'USER', idOnTheSource: null },
-      registry: {
-        listRegisteredIds: jest.fn().mockResolvedValue(['personal-vm']),
-        listAccessibleConfigurations: jest.fn().mockResolvedValue([
-          {
-            id: 'personal-vm',
-            name: 'Personal VM',
-            type: 'attached',
-            baseURL: 'https://persisted.example',
-            controlPlaneId: 'self-service',
-            owner: 'principal',
-            workerId: 'personal-worker',
-          },
-        ]),
-      },
-    });
+    try {
+      const result = await mergeAccessibleCodeEnvironments({
+        appConfig,
+        deploymentConfig: appConfig,
+        actor: { userId: '68b2f0c498f24c1e78fa0001', role: 'USER', idOnTheSource: null },
+        registry: {
+          listRegisteredIds: jest.fn().mockResolvedValue(['personal-vm']),
+          listAccessibleConfigurations: jest.fn().mockResolvedValue([
+            {
+              id: 'personal-vm',
+              name: 'Personal VM',
+              type: 'attached',
+              baseURL: 'https://persisted.example',
+              controlPlaneId: 'self-service',
+              owner: 'principal',
+              workerId: 'personal-worker',
+            },
+          ]),
+        },
+      });
 
-    const environments = result.endpoints?.agents?.statefulCodeSessions?.environments;
-    expect(environments?.find((environment) => environment.id === 'self-service')?.default).toBe(
-      false,
-    );
-    expect(environments?.find((environment) => environment.id === 'personal-vm')?.default).toBe(
-      true,
-    );
+      const environments = result.endpoints?.agents?.statefulCodeSessions?.environments;
+      expect(environments?.find((environment) => environment.id === 'personal-vm')).toEqual(
+        expect.objectContaining({ controlPlaneId: 'self-service', baseURL: pairingOnly.baseURL }),
+      );
+      expect(environments?.find((environment) => environment.id === 'self-service')?.default).toBe(
+        false,
+      );
+      expect(environments?.find((environment) => environment.id === 'personal-vm')?.default).toBe(
+        expectedDefault,
+      );
+    } finally {
+      if (originalStatefulURL == null) {
+        delete process.env.LIBRECHAT_CODE_BASEURL_STATEFUL;
+      } else {
+        process.env.LIBRECHAT_CODE_BASEURL_STATEFUL = originalStatefulURL;
+      }
+    }
   });
 });

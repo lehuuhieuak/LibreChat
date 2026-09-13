@@ -6,8 +6,10 @@ export * from './config';
 export * from './langchain';
 export * from './filters';
 export * from './file-config';
+export * from './resolve-llm-delivery-path';
 /* messages  */
 export * from './messages';
+export * from './errors';
 /* run steps */
 export * from './runSteps';
 /* artifacts  */
@@ -72,3 +74,5 @@ export * from './agentToolOptions';
 /* code-execution sandbox */
 export * from './codeEnvRef';
 export * from './code/worker';
+export * from './code/approval';
+export * from './code/workspace';

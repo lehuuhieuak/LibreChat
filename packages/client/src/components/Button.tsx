@@ -17,12 +17,23 @@ type ButtonVariantOptions =
         | 'secondary'
         | 'ghost'
         | 'row-action'
+        | 'section-header'
         | 'section-action'
         | 'header-action'
         | null
         | undefined;
-      size?: 'default' | 'icon' | 'icon-sm' | 'icon-xs' | 'sm' | 'lg' | 'theme' | null | undefined;
-      shape?: 'default' | 'theme' | null | undefined;
+      size?:
+        | 'default'
+        | 'icon'
+        | 'icon-sm'
+        | 'icon-xs'
+        | 'icon-theme'
+        | 'sm'
+        | 'lg'
+        | 'theme'
+        | null
+        | undefined;
+      shape?: 'default' | 'theme' | 'round' | null | undefined;
     } & ClassProp)
   | undefined;
 
@@ -54,6 +65,15 @@ const buttonVariantRecipe = cva(
         link: 'text-text-primary underline-offset-4 hover:underline',
         submit: 'bg-surface-submit text-text-on-status hover:bg-surface-submit-hover',
         /**
+         * The toggle that heads a collapsible sidebar section, such as Chats,
+         * Projects and Pinned. It reads as a quiet label rather than a control
+         * until focused, and keeps its ring inset because these sit flush
+         * against the section body. It carries its own metrics through the
+         * compound below, since a section heading is sized by its text.
+         */
+        'section-header':
+          'justify-start gap-1 rounded-lg px-1 py-2 text-xs font-bold text-text-secondary focus-visible:ring-inset focus-visible:ring-offset-0',
+        /**
          * A quiet icon action sitting beside a section heading in the sidebar.
          * Unlike `row-action`, it recedes until hovered so the heading stays
          * the thing being read, and its ring sits inside the control because
@@ -79,11 +99,18 @@ const buttonVariantRecipe = cva(
         icon: 'size-10',
         'icon-sm': 'size-8 p-0',
         'icon-xs': 'size-7',
+        /**
+         * A square icon control on the theme's control height — the size of
+         * every button in the composer's action row, for a control that has to
+         * line up with them.
+         */
+        'icon-theme': 'size-theme-control p-0',
         theme: 'h-theme-control gap-theme-compact px-theme-normal',
       },
       shape: {
         default: 'rounded-lg',
         theme: 'rounded-theme-control',
+        round: 'rounded-theme-control-round',
         unset: '',
       },
     },
@@ -92,6 +119,15 @@ const buttonVariantRecipe = cva(
         variant: 'subtle',
         shape: 'unset',
         class: 'rounded-xl',
+      },
+      /* A section heading is sized by its own text, so it opts out of the
+       * default size recipe that every other caller supplies explicitly.
+       * Without this the default `h-10 px-4` is emitted after the variant and
+       * wins the merge, giving a 40px control in a 32px header row. */
+      {
+        variant: 'section-header',
+        size: 'default',
+        class: 'h-auto px-1 py-2',
       },
     ],
     defaultVariants: {

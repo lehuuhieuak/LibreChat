@@ -180,6 +180,7 @@ async function callAndCapture(
   opts: {
     agents?: ReturnType<typeof makeAgent>[];
     summarizationConfig?: SummarizationConfig;
+    summarizeOnly?: boolean;
     initialSummary?: { text: string; tokenCount: number };
     appConfig?: AppConfig;
     messages?: BaseMessage[];
@@ -198,6 +199,7 @@ async function callAndCapture(
     agents: agents as never,
     signal,
     summarizationConfig: opts.summarizationConfig,
+    summarizeOnly: opts.summarizeOnly,
     initialSummary: opts.initialSummary,
     appConfig: opts.appConfig,
     messages: opts.messages,
@@ -647,6 +649,35 @@ describe('summarizationEnabled resolution', () => {
     const config = agents[0].summarizationConfig as Record<string, unknown>;
     expect(config.provider).toBe('openAI');
     expect(config.model).toBe('gpt-4o');
+  });
+
+  it('false when the effective context budget is below the viable minimum', async () => {
+    /**
+     * A tiny user-set maxContextTokens re-triggers summarization on every
+     * graph step until the recursion limit aborts the run; the guard falls
+     * back to plain pruning instead.
+     */
+    const agents = await callAndCapture({
+      agents: [makeAgent({ maxContextTokens: 10 })],
+      summarizationConfig: {
+        enabled: true,
+        provider: 'anthropic',
+        model: 'claude-3-haiku',
+      },
+    });
+    expect(agents[0].summarizationEnabled).toBe(false);
+  });
+
+  it('true at exactly the 1024-token viable minimum', async () => {
+    const agents = await callAndCapture({
+      agents: [makeAgent({ maxContextTokens: 1024 })],
+      summarizationConfig: {
+        enabled: true,
+        provider: 'anthropic',
+        model: 'claude-3-haiku',
+      },
+    });
+    expect(agents[0].summarizationEnabled).toBe(true);
   });
 });
 
@@ -2480,6 +2511,45 @@ describe('Langfuse run config', () => {
     });
   });
 
+  it('forwards the requesting user and trace context into the Langfuse run config', async () => {
+    await createRun({
+      agents: [makeAgent()] as never,
+      signal: new AbortController().signal,
+      streaming: true,
+      streamUsage: true,
+      user: { id: 'user-1', email: 'alice@example.com', role: 'ADMIN' } as never,
+      conversationId: 'convo-1',
+      requestBody: { conversationId: 'convo-stale' },
+      traceContext: { endpoint: 'agents', spec: 'support-bot' },
+      appConfig: {
+        langfuse: {
+          trace: {
+            userIdField: 'email',
+            userMetadataFields: ['role'],
+            conversationMetadataFields: ['conversationId', 'endpoint', 'provider', 'model', 'spec'],
+          },
+        },
+      } as unknown as AppConfig,
+    });
+
+    const createMock = Run.create as jest.Mock;
+    expect(createMock).toHaveBeenCalledTimes(1);
+    const callArgs = createMock.mock.calls[0][0] as Record<string, unknown>;
+    expect(callArgs.langfuse).toEqual({
+      deterministicTraceId: true,
+      userId: 'alice@example.com',
+      metadata: {
+        'librechat.user.role': 'ADMIN',
+        'librechat.conversation.id': 'convo-1',
+        'librechat.endpoint': 'agents',
+        'librechat.provider': 'openAI',
+        'librechat.model': 'gpt-4o',
+        'librechat.spec': 'support-bot',
+      },
+      librechatTraceAttributes: exportTelemetry('central_only', 'fanout_disabled'),
+    });
+  });
+
   it('adds tenant Langfuse credentials from tenant-scoped app config', async () => {
     process.env.LANGFUSE_FANOUT_ENABLED = 'true';
     process.env.LANGFUSE_FANOUT_COLLECTOR_URL = 'http://langfuse-fanout-collector:4318';
@@ -3602,5 +3672,24 @@ describe('ask_user_question run wiring', () => {
     const config = (Run.create as jest.Mock).mock.calls[0][0] as Record<string, unknown>;
     expect(config.humanInTheLoop).toBeDefined();
     expect(getCheckpointer(config)).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// summarizeOnly resolution (manual compaction)
+// ---------------------------------------------------------------------------
+describe('summarizeOnly resolution', () => {
+  it('is absent on an ordinary run', async () => {
+    const agents = await callAndCapture();
+    expect(agents[0].summarizeOnly).toBeUndefined();
+  });
+
+  it('marks only the primary agent of a compaction run', async () => {
+    const agents = await callAndCapture({
+      agents: [makeAgent({ id: 'agent_primary' }), makeAgent({ id: 'agent_next' })],
+      summarizeOnly: true,
+    });
+    expect(agents[0].summarizeOnly).toBe(true);
+    expect(agents[1].summarizeOnly).toBeUndefined();
   });
 });
