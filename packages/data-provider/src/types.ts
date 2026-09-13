@@ -1061,4 +1061,6 @@ export type TLangfuseConnectionTestResponse =
 
 export type TLangfuseSessionLinkResponse = {
   url: string | null;
+  /** Opaque identity of the project `url` opens, so a caller can tell whether it holds what it showed. */
+  destinationId?: string;
 };
